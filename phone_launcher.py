@@ -153,7 +153,9 @@ class Device:
     @property
     def label(self) -> str:
         name = self.model.replace("_", " ") or self.serial
-        extra = "" if self.state == "device" else f"  [{self.state}]"
+        extra = {"device": "", "unauthorized": "  [폰 잠금 풀고 'USB 디버깅 허용' 눌러주세요]",
+                 "offline": "  [연결 끊김 - 다시 연결 중]",
+                 "authorizing": "  [인증 중…]"}.get(self.state, f"  [{self.state}]")
         icon = "📶 " if self.wireless else ""
         return f"{icon}{name}  ({self.serial}){extra}"
 
@@ -283,17 +285,26 @@ class Phone:
             return False, self.unreachable_msg(addr)
         return False, out
 
-    def connect(self, addr: str) -> tuple[bool, str]:
-        if not self.reachable(addr):
+    def connect(self, addr: str, tries: int = 3) -> tuple[bool, str]:
+        # 폰 화면이 꺼져 있으면 Wi-Fi가 절전 상태라 첫 응답이 늦어요 → 몇 번 두드리며 재시도
+        out = ""
+        for i in range(tries):
+            self.reachable(addr, timeout=4)  # 깨우기용 접속 (실패해도 계속)
+            try:
+                out = self.adb_out("connect", addr, timeout=20)
+            except subprocess.TimeoutExpired:
+                out = "timeout"
+            if ("connected to" in out) and "cannot" not in out and "failed" not in out:
+                return True, out
+            if "offline" in out or "already" in out:
+                self.adb_out("disconnect", addr, timeout=8)
+            time.sleep(1.5)
+        if not self.reachable(addr, timeout=5):
             return False, (self.network_hint(addr) or
-                           "PC에서 폰의 그 주소로 접속이 안 돼요. 무선 디버깅 화면 맨 위의 "
-                           "'IP 주소 및 포트'가 맞는지 확인하세요 (페어링 포트와 달라요).")
-        try:
-            out = self.adb_out("connect", addr, timeout=20)
-        except subprocess.TimeoutExpired:
-            return False, "응답이 없어요 (시간 초과). 무선 디버깅을 껐다 켠 뒤 새 포트로 다시 해보세요."
-        ok = ("connected to" in out) and "cannot" not in out and "failed" not in out
-        return ok, out
+                           "PC에서 폰의 그 주소로 접속이 안 돼요.\n"
+                           "• 무선 디버깅 화면 맨 위의 'IP 주소 및 포트'가 맞는지 확인하세요 (페어링 포트와 달라요).\n"
+                           "• 폰 화면이 꺼져 있으면 Wi-Fi가 잠들 수 있어요. 폰 설정에서 Wi-Fi 절전을 꺼주세요.")
+        return False, out
 
     MDNS_RE = re.compile(r"_adb-tls-(connect|pairing)\._tcp\.?\s+(\d+\.\d+\.\d+\.\d+:\d+)")
 
@@ -1131,6 +1142,37 @@ class MainWindow(QMainWindow):
             self.bus.devices.emit(self._safe(self.phone.devices, default=[]))
         bg(work)
 
+    def _maybe_reconnect(self):
+        """무선 폰이 사라지거나 offline이면 15초마다 조용히 다시 연결 시도."""
+        addr = self.cfg.get("wifi_addr")
+        if not (addr and self.cfg.get("wifi_auto", True) and self.phone.adb):
+            return
+        if any(d.state == "device" for d in self.devices):
+            return
+        now = time.time()
+        if getattr(self, "_reconn_busy", False) or now - getattr(self, "_reconn_at", 0) < 15:
+            return
+        self._reconn_at, self._reconn_busy = now, True
+
+        def work():
+            try:
+                addrs = self.phone.mdns()["connect"]
+                if addr not in addrs:
+                    addrs.append(addr)
+                for a in addrs:
+                    ok, _ = self.phone.connect(a, tries=1)
+                    if ok:
+                        if a != addr:
+                            self.cfg["wifi_addr"] = a
+                            save_config(self.cfg)
+                        self.bus.status.emit(f"📶 다시 연결됨: {a}")
+                        break
+            except Exception:
+                pass
+            finally:
+                self._reconn_busy = False
+        bg(work)
+
     def refresh_devices(self):
         bg(lambda: self.bus.devices.emit(self._safe(self.phone.devices, default=[])))
 
@@ -1526,6 +1568,7 @@ class MainWindow(QMainWindow):
         self.batt.setText(f"🔋 {b['level']}%  ·  {charge}  ·  {temp}")
 
     def _tick(self):
+        self._maybe_reconnect()
         self.refresh_devices()
         self._render_sessions()
         self._update_mirror_btn()
