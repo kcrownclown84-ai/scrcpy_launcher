@@ -1441,12 +1441,15 @@ class MainWindow(QMainWindow):
                                           self.s_land.setChecked(self.cfg["aspect_landscape"]),
                                           self.s_land.blockSignals(False), self._reopen_main()))
 
-    def open_main(self, serial: str, start_app: str | None = None) -> Session:
+    def open_main(self, serial: str, start_app: str | None = None,
+                  screen_off: bool | None = None) -> Session:
         args = self.phone.base_args(serial, self.cfg)
         vd = aspect_display(self.cfg)
         if vd:  # 원하는 비율의 가상 화면을 만들어서 그 안에서 앱 실행 (폰 본체 화면과 별개)
             args.append(f"--new-display={vd}")
-        elif self.cfg["turn_screen_off"]:
+        if screen_off is None:
+            screen_off = bool(self.cfg["turn_screen_off"])
+        if screen_off:  # 폰은 깨어 있게 두고 화면 패널만 끔 → 폰 화면이 꺼져도 PC에서는 계속 동작
             args.append("--turn-screen-off")
         args += self._dock_args()
         title = f"{APP_NAME} - {self._device_name(serial)}"
@@ -1466,6 +1469,8 @@ class MainWindow(QMainWindow):
             args = self.phone.base_args(serial, self.cfg)
             args += [f"--new-display={self.cfg['virtual_size']}",
                      f"--start-app={target}", f"--window-title={name}"]
+            if self.cfg["turn_screen_off"]:
+                args.append("--turn-screen-off")
             # 가상 디스플레이에서는 폰 본체 화면이 잠들지 않게만 유지
             self._spawn(args, serial, name, "app")
             self.bus.status.emit(f"'{name}' 새 창으로 실행")
@@ -1600,69 +1605,34 @@ class MainWindow(QMainWindow):
 
     _ui = bus_call
 
-    def _send_scrcpy_keys(self, s: Session, shift: bool) -> bool:
-        """폰 화면 창에 Alt+O(끄기) / Alt+Shift+O(켜기)를 보낸다. 창을 앞으로 못 가져오면 False."""
-        if not IS_WIN:
-            return False
-        import ctypes
-        user32 = ctypes.windll.user32
-        hwnd = user32.FindWindowW(None, s.title)
-        if not hwnd:
-            return False
-        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-        user32.SetForegroundWindow(hwnd)
-        time.sleep(0.15)
-        if user32.GetForegroundWindow() != hwnd:
-            return False  # 엉뚱한 창에 단축키가 가지 않게
-        VK_MENU, VK_SHIFT, VK_O, UP = 0x12, 0x10, 0x4F, 0x0002
-        keys = [VK_MENU] + ([VK_SHIFT] if shift else []) + [VK_O]
-        for k in keys:
-            user32.keybd_event(k, 0, 0, 0)
-        for k in reversed(keys):
-            user32.keybd_event(k, 0, UP, 0)
-        return True
-
     def toggle_panel(self):
+        """폰 본체 화면 끄기/켜기: 폰 화면 창을 화면 끄기 옵션을 바꿔서 다시 연다 (확실한 방법)."""
         serial = self.current_serial()
         s = serial and self._main_session(serial)
         if not s:
             self.statusBar().showMessage("먼저 '폰 화면 열기'를 눌러주세요.", 4000)
             return
-        turn_on = getattr(s, "panel_off", bool(self.cfg["turn_screen_off"]))
-        if self._send_scrcpy_keys(s, shift=turn_on):
-            s.panel_off = not turn_on
-            self.statusBar().showMessage("폰 화면을 켰어요." if turn_on else "폰 화면을 껐어요. PC에서는 계속 보여요.", 4000)
-        else:
-            self.statusBar().showMessage("폰 화면 창을 클릭한 뒤 Alt+O(끄기) / Alt+Shift+O(켜기)를 눌러주세요.", 6000)
-
-    def _keep_awake_watch(self):
-        """폰 전원 버튼을 눌러 폰이 잠들면 PC 화면이 까매짐 → 깨우고 폰 화면 창을 다시 열어 화면 끄기를 다시 적용."""
-        serial = self.current_serial()
-        s = serial and self._main_session(serial)
-        if not s or getattr(self, "_watch_busy", False) or time.time() - s.started < 6:
-            return
-        self._watch_busy = True
+        off_now = getattr(s, "panel_off", bool(self.cfg["turn_screen_off"]))
+        want_off = not off_now
+        s.proc.terminate()
 
         def work():
             try:
-                if not self.phone.is_awake(serial):
-                    self.phone.key(serial, 224)  # WAKEUP
-                    self.bus.status.emit("폰이 잠들어서 다시 깨웠어요 (폰 전원 버튼 대신 런처의 ⏻ 버튼을 쓰세요).")
-                    s.proc.terminate()
-                    try:
-                        s.proc.wait(timeout=4)
-                    except Exception:
-                        pass
-                    time.sleep(0.8)
-                    self._ui(lambda: (self.open_main(serial), self._update_mirror_btn()))
+                s.proc.wait(timeout=4)
             except Exception:
                 pass
-            finally:
-                self._watch_busy = False
+            time.sleep(0.5)
+
+            def reopen():
+                ns = self.open_main(serial, screen_off=want_off)
+                ns.panel_off = want_off
+                self._update_mirror_btn()
+                self.statusBar().showMessage("폰 화면을 껐어요. PC에서는 계속 보여요." if want_off
+                                             else "폰 화면을 켰어요.", 4000)
+            self.bus_call(reopen)
         bg(work)
 
     def _tick(self):
-        self._keep_awake_watch()
         self._maybe_reconnect()
         self.refresh_devices()
         self._render_sessions()
