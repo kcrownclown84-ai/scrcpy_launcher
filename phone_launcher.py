@@ -395,13 +395,15 @@ class Phone:
     def pattern_points(self, serial: str) -> dict:
         """잠금 패턴 9개 점의 화면 좌표 {1:(x,y) … 9:(x,y)} (1=왼쪽 위, 9=오른쪽 아래)."""
         tmp = "/data/local/tmp/pl_ui.xml"
-        self.shell(serial, "uiautomator", "dump", tmp, timeout=25)
+        self.pattern_debug = self.shell(serial, "uiautomator", "dump", tmp, timeout=25)
         xml = self.shell(serial, "cat", tmp, timeout=10)
+        self.pattern_xml = xml
         self.shell(serial, "rm", "-f", tmp)
         box = None
         for m in re.finditer(r'<node [^>]*?resource-id="([^"]*)"[^>]*?bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', xml):
             if "pattern" in m.group(1).lower():
                 box = tuple(int(m.group(i)) for i in range(2, 6))
+                self.pattern_debug += f" found {m.group(1)} {box}"
                 break
         if not box:  # 못 찾으면 일반적인 위치로 추정 (화면 아래쪽 가운데 정사각형)
             out = self.shell(serial, "wm", "size")
