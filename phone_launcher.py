@@ -25,7 +25,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QFrame,
+    QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QFrame,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
     QMenu, QMessageBox, QPushButton, QSpinBox, QStatusBar, QTabWidget,
     QToolButton, QVBoxLayout, QWidget,
@@ -63,6 +63,8 @@ DEFAULT_CONFIG = {
     "show_system_apps": False,
     "theme": "dark",            # dark | light | system
     "favorites": [],
+    "wifi_addr": "",            # 마지막으로 무선 연결한 IP:포트
+    "wifi_auto": True,          # 시작할 때 무선 자동 재연결
 }
 
 
@@ -146,7 +148,12 @@ class Device:
     def label(self) -> str:
         name = self.model.replace("_", " ") or self.serial
         extra = "" if self.state == "device" else f"  [{self.state}]"
-        return f"{name}  ({self.serial}){extra}"
+        icon = "📶 " if self.wireless else ""
+        return f"{icon}{name}  ({self.serial}){extra}"
+
+    @property
+    def wireless(self) -> bool:
+        return ":" in self.serial or "_adb-tls" in self.serial
 
 
 @dataclass
@@ -188,6 +195,34 @@ class Phone:
                     model = p[6:]
             devs.append(Device(parts[0], model, parts[1]))
         return devs
+
+    # --- 무선 (Android 11+ 무선 디버깅) ----------------------------------------
+    def adb_out(self, *args: str, timeout: float = 15) -> str:
+        r = run([self.adb, *args], timeout=timeout)
+        return (r.stdout + r.stderr).decode("utf-8", "replace").strip()
+
+    def pair(self, addr: str, code: str) -> tuple[bool, str]:
+        out = self.adb_out("pair", addr, code, timeout=20)
+        return ("Successfully paired" in out, out)
+
+    def connect(self, addr: str) -> tuple[bool, str]:
+        out = self.adb_out("connect", addr, timeout=12)
+        ok = ("connected to" in out) and "cannot" not in out and "failed" not in out
+        return ok, out
+
+    MDNS_RE = re.compile(r"_adb-tls-(connect|pairing)\._tcp\.?\s+(\d+\.\d+\.\d+\.\d+:\d+)")
+
+    def mdns(self) -> dict:
+        """같은 네트워크의 무선 디버깅 폰 찾기 → {"connect": [...], "pairing": [...]}"""
+        found = {"connect": [], "pairing": []}
+        try:
+            out = self.adb_out("mdns", "services", timeout=8)
+        except Exception:
+            return found
+        for kind, addr in self.MDNS_RE.findall(out):
+            if addr not in found[kind]:
+                found[kind].append(addr)
+        return found
 
     def shell(self, serial: str, *args: str, timeout: float = 10) -> str:
         r = run([self.adb, "-s", serial, "shell", *args], timeout=timeout)
@@ -372,6 +407,154 @@ def build_style(theme: str) -> str:
     return Template(STYLE_TMPL).substitute(THEMES[theme])
 
 
+
+class WifiDialog(QDialog):
+    """무선 디버깅으로 폰 연결 (페어링 + 연결)."""
+    result = Signal(str, bool, str)  # 동작, 성공, 메시지
+    found = Signal(dict)
+
+    def __init__(self, win: "MainWindow"):
+        super().__init__(win)
+        self.win = win
+        self.phone = win.phone
+        self.setWindowTitle("무선으로 폰 연결")
+        self.setMinimumWidth(460)
+        v = QVBoxLayout(self)
+        v.setSpacing(10)
+
+        guide = QLabel(
+            "<b>폰 준비</b> (Android 11 이상, PC와 같은 공유기)<br>"
+            "설정 → 개발자 옵션 → <b>무선 디버깅</b> 켜기<br>"
+            "처음 한 번은 <b>'페어링 코드로 기기 페어링'</b>을 눌러<br>"
+            "나오는 IP:포트와 6자리 코드를 아래 ①에 입력하세요."
+        )
+        guide.setWordWrap(True)
+        v.addWidget(guide)
+
+        btn_scan = QPushButton("🔍  네트워크에서 폰 자동 찾기")
+        btn_scan.setObjectName("flat")
+        btn_scan.clicked.connect(self.scan)
+        v.addWidget(btn_scan)
+
+        v.addWidget(QLabel("① 처음 한 번만: 페어링"))
+        prow = QHBoxLayout()
+        self.pair_addr = QLineEdit(placeholderText="예) 192.168.0.12:41234")
+        self.pair_code = QLineEdit(placeholderText="6자리 코드")
+        self.pair_code.setMaximumWidth(110)
+        self.btn_pair = QPushButton("페어링")
+        self.btn_pair.clicked.connect(self.do_pair)
+        prow.addWidget(self.pair_addr, 1)
+        prow.addWidget(self.pair_code)
+        prow.addWidget(self.btn_pair)
+        v.addLayout(prow)
+
+        v.addWidget(QLabel("② 연결 (무선 디버깅 화면 위쪽의 'IP 주소 및 포트')"))
+        crow = QHBoxLayout()
+        self.conn_addr = QComboBox()
+        self.conn_addr.setEditable(True)
+        self.conn_addr.lineEdit().setPlaceholderText("예) 192.168.0.12:37555")
+        if win.cfg.get("wifi_addr"):
+            self.conn_addr.addItem(win.cfg["wifi_addr"])
+        self.btn_conn = QPushButton("연결")
+        self.btn_conn.clicked.connect(self.do_connect)
+        crow.addWidget(self.conn_addr, 1)
+        crow.addWidget(self.btn_conn)
+        v.addLayout(crow)
+
+        self.auto = QCheckBox("런처를 켤 때 자동으로 다시 연결")
+        self.auto.setChecked(bool(win.cfg.get("wifi_auto", True)))
+        self.auto.toggled.connect(lambda on: win._set("wifi_auto", on))
+        v.addWidget(self.auto)
+
+        self.msg = QLabel("")
+        self.msg.setWordWrap(True)
+        self.msg.setObjectName("muted")
+        v.addWidget(self.msg)
+
+        tip = QLabel("무선은 USB보다 조금 느릴 수 있어요. 끊기면 설정 탭에서 화질(비트레이트)을 4~6 Mbps로 낮춰보세요.")
+        tip.setWordWrap(True)
+        tip.setObjectName("muted")
+        v.addWidget(tip)
+
+        self.result.connect(self._on_result)
+        self.found.connect(self._on_found)
+        self.scan()
+
+    def _busy(self, text):
+        self.msg.setText(text)
+
+    def scan(self):
+        if not self.phone.adb:
+            self._busy("adb를 찾지 못했어요.")
+            return
+        self._busy("같은 네트워크에서 무선 디버깅이 켜진 폰을 찾는 중…")
+        bg(lambda: self.found.emit(self.phone.mdns()))
+
+    def _on_found(self, f: dict):
+        for a in f["connect"]:
+            if self.conn_addr.findText(a) < 0:
+                self.conn_addr.insertItem(0, a)
+        if f["connect"]:
+            self.conn_addr.setCurrentIndex(0)
+        if f["pairing"] and not self.pair_addr.text():
+            self.pair_addr.setText(f["pairing"][0])
+        if f["connect"] or f["pairing"]:
+            self._busy(f"찾았어요: 연결 {len(f['connect'])}개, 페어링 대기 {len(f['pairing'])}개")
+        else:
+            self._busy("자동으로 못 찾았어요. 폰 화면의 IP:포트를 직접 입력하세요.")
+
+    def do_pair(self):
+        addr, code = self.pair_addr.text().strip(), self.pair_code.text().strip()
+        if not addr or not code:
+            self._busy("페어링 IP:포트와 6자리 코드를 입력하세요.")
+            return
+        self._busy("페어링 중…")
+
+        def work():
+            try:
+                ok, out = self.phone.pair(addr, code)
+            except Exception as e:
+                ok, out = False, str(e)
+            self.result.emit("pair", ok, out)
+            if ok:  # 페어링되면 연결 포트를 찾아 바로 연결 시도
+                time.sleep(1.5)
+                self.found.emit(self.phone.mdns())
+        bg(work)
+
+    def do_connect(self):
+        addr = self.conn_addr.currentText().strip()
+        if not addr:
+            self._busy("연결할 IP:포트를 입력하세요.")
+            return
+        if ":" not in addr:
+            addr += ":5555"
+        self._busy(f"{addr} 연결 중…")
+
+        def work():
+            try:
+                ok, out = self.phone.connect(addr)
+            except Exception as e:
+                ok, out = False, str(e)
+            self.result.emit("connect:" + addr, ok, out)
+        bg(work)
+
+    def _on_result(self, action: str, ok: bool, out: str):
+        if action == "pair":
+            self._busy("✅ 페어링 완료! 이제 ② 연결을 누르세요." if ok else
+                       f"❌ 페어링 실패: {out}\n코드는 금방 바뀌어요. 폰에서 새 코드를 띄워 다시 해보세요.")
+            if ok and self.conn_addr.currentText():
+                self.do_connect()
+            return
+        addr = action.split(":", 1)[1]
+        if ok:
+            self.win._set("wifi_addr", addr)
+            self._busy(f"✅ {addr} 연결됐어요.")
+            self.win.refresh_devices()
+            QTimer.singleShot(800, self.accept)
+        else:
+            self._busy(f"❌ 연결 실패: {out}\n처음이면 ① 페어링을 먼저 하세요. 무선 디버깅을 껐다 켜면 포트가 바뀌어요.")
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -396,6 +579,7 @@ class MainWindow(QMainWindow):
         self.poll = QTimer(self, interval=3000, timeout=self._tick)
         self.poll.start()
         self.refresh_devices()
+        self.auto_wifi()
 
     # ---------------- UI ----------------
     def _build_ui(self):
@@ -422,6 +606,12 @@ class MainWindow(QMainWindow):
         top.addWidget(QLabel("📱"))
         top.addWidget(self.dev_combo, 1)
         top.addWidget(btn_refresh)
+        btn_wifi = QPushButton("📶")
+        btn_wifi.setObjectName("flat")
+        btn_wifi.setFixedWidth(38)
+        btn_wifi.setToolTip("무선(Wi-Fi)으로 연결")
+        btn_wifi.clicked.connect(self.open_wifi)
+        top.addWidget(btn_wifi)
         top.addWidget(self.btn_mirror)
         v.addLayout(top)
 
@@ -652,6 +842,35 @@ class MainWindow(QMainWindow):
             return self.devices[i].serial
         return None
 
+    def open_wifi(self):
+        if not self.phone.adb:
+            QMessageBox.warning(self, APP_NAME, "adb를 찾지 못했어요. 설정 탭에서 scrcpy 위치를 확인하세요.")
+            return
+        WifiDialog(self).exec()
+
+    def auto_wifi(self):
+        """시작할 때 마지막 무선 주소(또는 자동 검색된 폰)로 재연결."""
+        if not self.phone.adb or not self.cfg.get("wifi_auto", True):
+            return
+
+        def work():
+            try:
+                addrs = self.phone.mdns()["connect"]
+                last = self.cfg.get("wifi_addr")
+                if last and last not in addrs:
+                    addrs.append(last)
+                for a in addrs:
+                    ok, _ = self.phone.connect(a)
+                    if ok:
+                        self.cfg["wifi_addr"] = a
+                        save_config(self.cfg)
+                        self.bus.status.emit(f"📶 무선 연결됨: {a}")
+                        break
+            except Exception:
+                pass
+            self.bus.devices.emit(self._safe(self.phone.devices, default=[]))
+        bg(work)
+
     def refresh_devices(self):
         bg(lambda: self.bus.devices.emit(self._safe(self.phone.devices, default=[])))
 
@@ -666,7 +885,7 @@ class MainWindow(QMainWindow):
         for d in devs:
             self.dev_combo.addItem(d.label)
         if not devs:
-            self.dev_combo.addItem("연결된 폰 없음 — USB 디버깅 켜고 연결하세요")
+            self.dev_combo.addItem("연결된 폰 없음 — USB 연결 또는 📶 무선 연결")
         idx = next((i for i, d in enumerate(devs) if d.serial == cur), 0)
         self.dev_combo.setCurrentIndex(idx)
         self.dev_combo.blockSignals(False)
