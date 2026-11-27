@@ -178,11 +178,31 @@ class Phone:
     def __init__(self, scrcpy: str | None, adb: str | None):
         self.scrcpy = scrcpy
         self.adb = adb
+        self._server_ok = False
+        self._lock = threading.Lock()
 
     # --- adb -----------------------------------------------------------------
+    def ensure_server(self) -> None:
+        """adb 서버를 출력 캡처 없이 먼저 띄운다.
+        Windows에서 출력을 캡처하는 adb 명령이 서버를 처음 띄우면, 서버가 파이프를 물고 있어서
+        명령이 끝나지 않고 타임아웃 나는 문제가 있음 (페어링 타임아웃의 주원인)."""
+        if self._server_ok or not self.adb:
+            return
+        with self._lock:
+            if self._server_ok:
+                return
+            try:
+                subprocess.run([self.adb, "start-server"], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=30, creationflags=NO_WINDOW)
+            except Exception:
+                pass
+            self._server_ok = True
+
     def devices(self) -> list[Device]:
         if not self.adb:
             return []
+        self.ensure_server()
         out = run([self.adb, "devices", "-l"]).stdout.decode("utf-8", "replace")
         devs = []
         for line in out.splitlines()[1:]:
@@ -198,15 +218,51 @@ class Phone:
 
     # --- 무선 (Android 11+ 무선 디버깅) ----------------------------------------
     def adb_out(self, *args: str, timeout: float = 15) -> str:
+        self.ensure_server()
         r = run([self.adb, *args], timeout=timeout)
         return (r.stdout + r.stderr).decode("utf-8", "replace").strip()
 
+    @staticmethod
+    def reachable(addr: str, timeout: float = 3) -> bool:
+        """PC에서 폰의 IP:포트로 TCP 연결이 되는지 미리 확인."""
+        import socket
+        try:
+            host, port = addr.rsplit(":", 1)
+            with socket.create_connection((host, int(port)), timeout=timeout):
+                return True
+        except Exception:
+            return False
+
+    UNREACHABLE = ("PC에서 폰의 그 주소로 접속이 안 돼요.\n"
+                   "• 폰의 페어링 창이 닫히면 포트가 사라져요. 창을 띄운 채로, 새 IP:포트와 코드로 다시 하세요.\n"
+                   "• 공유기의 게스트 Wi-Fi나 'AP 격리/무선 격리'가 켜져 있으면 유선 PC와 통신이 막혀요.")
+
     def pair(self, addr: str, code: str) -> tuple[bool, str]:
-        out = self.adb_out("pair", addr, code, timeout=20)
-        return ("Successfully paired" in out, out)
+        # 페어링 포트에 미리 접속해보면 폰이 창을 닫을 수 있어서, 확인은 실패한 뒤에만 함
+        try:
+            out = self.adb_out("pair", addr, code, timeout=40)
+        except subprocess.TimeoutExpired:
+            if not self.reachable(addr):
+                return False, self.UNREACHABLE
+            return False, ("응답이 없어요 (시간 초과).\n"
+                           "• 폰에서 페어링 창을 닫았다가 새 코드로 다시 해보세요.\n"
+                           "• 그래도 안 되면 런처를 껐다 켠 뒤 다시 시도하세요.")
+        if "Successfully paired" in out:
+            return True, out
+        if "Wrong password" in out or "protocol fault" in out:
+            return False, "코드가 틀렸거나 만료됐어요. 폰에서 새 코드를 띄워 다시 입력하세요."
+        if not self.reachable(addr):
+            return False, self.UNREACHABLE
+        return False, out
 
     def connect(self, addr: str) -> tuple[bool, str]:
-        out = self.adb_out("connect", addr, timeout=12)
+        if not self.reachable(addr):
+            return False, ("PC에서 폰의 그 주소로 접속이 안 돼요. 무선 디버깅 화면 맨 위의 "
+                           "'IP 주소 및 포트'가 맞는지 확인하세요 (페어링 포트와 달라요).")
+        try:
+            out = self.adb_out("connect", addr, timeout=20)
+        except subprocess.TimeoutExpired:
+            return False, "응답이 없어요 (시간 초과). 무선 디버깅을 껐다 켠 뒤 새 포트로 다시 해보세요."
         ok = ("connected to" in out) and "cannot" not in out and "failed" not in out
         return ok, out
 
@@ -225,6 +281,7 @@ class Phone:
         return found
 
     def shell(self, serial: str, *args: str, timeout: float = 10) -> str:
+        self.ensure_server()
         r = run([self.adb, "-s", serial, "shell", *args], timeout=timeout)
         return r.stdout.decode("utf-8", "replace")
 
@@ -541,7 +598,7 @@ class WifiDialog(QDialog):
     def _on_result(self, action: str, ok: bool, out: str):
         if action == "pair":
             self._busy("✅ 페어링 완료! 이제 ② 연결을 누르세요." if ok else
-                       f"❌ 페어링 실패: {out}\n코드는 금방 바뀌어요. 폰에서 새 코드를 띄워 다시 해보세요.")
+                       f"❌ 페어링 실패\n{out}")
             if ok and self.conn_addr.currentText():
                 self.do_connect()
             return
@@ -552,7 +609,7 @@ class WifiDialog(QDialog):
             self.win.refresh_devices()
             QTimer.singleShot(800, self.accept)
         else:
-            self._busy(f"❌ 연결 실패: {out}\n처음이면 ① 페어링을 먼저 하세요. 무선 디버깅을 껐다 켜면 포트가 바뀌어요.")
+            self._busy(f"❌ 연결 실패\n{out}\n처음이면 ① 페어링을 먼저 하세요.")
 
 
 class MainWindow(QMainWindow):
