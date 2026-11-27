@@ -85,10 +85,26 @@ jobs:
           "SCRCPY_VERSION=$($rel.tag_name)" >> $env:GITHUB_ENV
           Get-ChildItem scrcpy
 
-      - run: pip install -r requirements.txt pyinstaller
+      - run: pip install -r requirements.txt pyinstaller pefile
 
       - name: Build single exe (launcher + scrcpy + adb)
         run: pyinstaller --noconfirm --onefile --windowed --name PhoneLauncher --icon assets/icon.ico --add-data "scrcpy;scrcpy" --add-data "assets;assets" phone_launcher.py
+
+      - name: Verify exe icon is embedded
+        shell: python
+        run: |
+          import pefile, struct
+          pe = pefile.PE("dist/PhoneLauncher.exe")
+          groups = []
+          for t in pe.DIRECTORY_ENTRY_RESOURCE.entries:
+              if t.id == 14:  # RT_GROUP_ICON
+                  for e in t.directory.entries:
+                      for l in e.directory.entries:
+                          d = pe.get_data(l.data.struct.OffsetToData, l.data.struct.Size)
+                          groups.append(struct.unpack("<HHH", d[:6])[2])
+          print("icon groups:", groups)
+          assert groups and groups[0] == 10, "custom icon (10 sizes) not embedded"
+          print("ICON OK")
 
       - name: Package
         shell: pwsh
