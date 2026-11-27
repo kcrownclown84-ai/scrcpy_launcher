@@ -34,7 +34,7 @@ jobs:
       - run: pip install -r requirements.txt pyinstaller
 
       - name: Build single exe (launcher + scrcpy + adb)
-        run: pyinstaller --noconfirm --onefile --windowed --name PhoneLauncher --add-data "scrcpy;scrcpy" phone_launcher.py
+        run: pyinstaller --noconfirm --onefile --windowed --name PhoneLauncher --icon assets/icon.ico --add-data "scrcpy;scrcpy" --add-data "assets;assets" phone_launcher.py
 
       - name: Package
         shell: pwsh

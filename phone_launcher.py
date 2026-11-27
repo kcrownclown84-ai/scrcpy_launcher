@@ -1208,7 +1208,14 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
-    app.setWindowIcon(letter_icon("📱", "phone", 128))
+    if IS_WIN:  # 작업표시줄에 파이썬 아이콘 대신 런처 아이콘이 보이게
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("PhoneLauncher.App")
+        except Exception:
+            pass
+    icon_file = APP_DIR / "assets" / "icon.png"
+    app.setWindowIcon(QIcon(str(icon_file)) if icon_file.is_file() else letter_icon("P", "phone", 128))
     w = MainWindow()
     w.show()
     sys.exit(app.exec())

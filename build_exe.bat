@@ -44,7 +44,7 @@ echo [3/4] Installing PySide6 + PyInstaller ^(takes a few minutes^) ...
 if errorlevel 1 goto :fail
 
 echo [4/4] Building exe ...
-".venv\Scripts\python.exe" -m PyInstaller --noconfirm --onefile --windowed --name PhoneLauncher phone_launcher.py
+".venv\Scripts\python.exe" -m PyInstaller --noconfirm --onefile --windowed --name PhoneLauncher --icon assets\icon.ico --add-data "assets;assets" phone_launcher.py
 if errorlevel 1 goto :fail
 
 echo.
