@@ -356,7 +356,7 @@ class Phone:
                 got = {}
                 for line in r.stdout.decode("utf-8", "replace").splitlines():
                     bits = line.strip().split(" ", 1)
-                    if len(bits) == 2 and bits[1] != "-" and bits[0] in part:
+                    if len(bits) == 2 and not bits[1].startswith("-") and bits[0] in part:
                         try:
                             got[bits[0]] = base64.b64decode(bits[1])
                         except Exception:

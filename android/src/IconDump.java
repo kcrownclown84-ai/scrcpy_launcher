@@ -56,7 +56,10 @@ public final class IconDump {
                 bmp.compress(Bitmap.CompressFormat.PNG, 100, bos);
                 out.println(pkg + " " + Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP));
             } catch (Throwable t) {
-                out.println(pkg + " -");
+                Throwable root = t;
+                while (root.getCause() != null) root = root.getCause();
+                out.println(pkg + " - " + root.getClass().getName() + ": " + root.getMessage());
+                if (System.getenv("ICONDUMP_DEBUG") != null) t.printStackTrace(out);
             }
         }
         out.flush();

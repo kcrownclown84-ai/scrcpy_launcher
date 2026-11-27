@@ -49,9 +49,9 @@ jobs:
           disable-animations: true
           script: |
             adb push iconhelper.jar /data/local/tmp/pl_icons.jar
-            adb shell CLASSPATH=/data/local/tmp/pl_icons.jar app_process / IconDump 96 com.android.settings com.android.chrome no.such.app > icons.txt; cat icons.txt | cut -c1-120
+            adb shell ICONDUMP_DEBUG=1 CLASSPATH=/data/local/tmp/pl_icons.jar app_process / IconDump 96 com.android.settings com.android.chrome no.such.app > icons.txt 2>&1; cat icons.txt | cut -c1-200
             test "$(grep -c '^com.android.settings iVBOR' icons.txt)" = "1"
-            grep -q '^no.such.app -' icons.txt
+            grep -q '^no.such.app - ' icons.txt
             echo "ICON HELPER OK"
 
   build:
