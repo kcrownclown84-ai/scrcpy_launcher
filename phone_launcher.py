@@ -34,7 +34,11 @@ from PySide6.QtWidgets import (
 APP_NAME = "폰 런처"
 APP_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 EXE_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
-CONFIG_PATH = EXE_DIR / "phone_launcher_config.json"
+# 설정 파일은 exe 옆이 아니라 %APPDATA%\\PhoneLauncher 에 저장 (설정을 바꿀 때만 생성됨)
+CONFIG_DIR = Path(os.environ.get("APPDATA") or (Path.home() / ".config")) / "PhoneLauncher"
+CONFIG_PATH = CONFIG_DIR / "config.json"
+LEGACY_CONFIG = EXE_DIR / "phone_launcher_config.json"
+NO_SAVE = "--no-save" in sys.argv  # 바로가기에 --no-save 를 붙이면 아무 파일도 안 남김
 SHOT_DIR = Path.home() / "Pictures" / "PhoneLauncher"
 
 IS_WIN = os.name == "nt"
@@ -64,6 +68,15 @@ DEFAULT_CONFIG = {
 
 def load_config() -> dict:
     cfg = dict(DEFAULT_CONFIG)
+    cfg["favorites"] = []
+    if LEGACY_CONFIG.is_file():  # 예전 버전이 exe 옆에 만든 파일은 옮기고 지움
+        try:
+            if not NO_SAVE and not CONFIG_PATH.exists():
+                CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+                CONFIG_PATH.write_bytes(LEGACY_CONFIG.read_bytes())
+            LEGACY_CONFIG.unlink()
+        except Exception:
+            pass
     try:
         cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
     except Exception:
@@ -72,7 +85,10 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> None:
+    if NO_SAVE:
+        return
     try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception:
         pass
@@ -81,6 +97,14 @@ def save_config(cfg: dict) -> None:
 # ----------------------------------------------------------------------------
 # scrcpy / adb 래퍼
 # ----------------------------------------------------------------------------
+def delete_saved_config() -> None:
+    shutil.rmtree(CONFIG_DIR, ignore_errors=True)
+    try:
+        LEGACY_CONFIG.unlink()
+    except Exception:
+        pass
+
+
 def find_scrcpy(custom: str = "") -> str | None:
     candidates = []
     if custom:
@@ -562,6 +586,16 @@ class MainWindow(QMainWindow):
         tips.setWordWrap(True)
         tips.setObjectName("muted")
         f.addRow(tips)
+
+        self.s_nosave = QCheckBox("설정 저장 안 함 (PC에 설정 파일을 남기지 않음)")
+        self.s_nosave.setChecked(NO_SAVE)
+        self.s_nosave.toggled.connect(self._toggle_nosave)
+        f.addRow(self.s_nosave)
+        where = QLabel(f"설정 파일 위치: {CONFIG_PATH}")
+        where.setObjectName("muted")
+        where.setWordWrap(True)
+        where.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        f.addRow(where)
         return w
 
     # ---------------- 이벤트 연결 ----------------
@@ -576,6 +610,16 @@ class MainWindow(QMainWindow):
         for lst in (self.app_list, self.fav_list):
             lst.itemClicked.connect(self._on_app_clicked)
             lst.customContextMenuRequested.connect(lambda pos, l=lst: self._app_menu(l, pos))
+
+    def _toggle_nosave(self, on: bool):
+        global NO_SAVE
+        NO_SAVE = on
+        if on:
+            delete_saved_config()
+            self.statusBar().showMessage("저장된 설정 파일을 지웠어요. 지금부터 바꾸는 설정은 끄면 사라져요.", 8000)
+        else:
+            save_config(self.cfg)
+            self.statusBar().showMessage(f"설정을 저장했어요: {CONFIG_PATH}", 6000)
 
     def apply_theme(self):
         self.setStyleSheet(build_style(self.cfg.get("theme", "dark")))
