@@ -74,7 +74,7 @@ DEFAULT_CONFIG = {
     "favorites": [],
     "wifi_addr": "",            # 마지막으로 무선 연결한 IP:포트
     "wifi_auto": True,          # 시작할 때 무선 자동 재연결
-    "embed_mirror": True,       # 폰 화면을 런처 안에 넣기 (Windows)
+    "embed_mirror_exp": False,  # (실험) 폰 화면을 런처 안에 넣기 - 일부 PC에서 클릭이 안 먹어서 기본 꺼짐
     "auto_mirror": True,        # 폰이 연결되면 폰 화면 자동으로 열기
     "power_save": False,        # 절전 모드: 해상도·FPS·화질을 낮춰 폰 발열/배터리 절약
 }
@@ -812,7 +812,7 @@ class MainWindow(QMainWindow):
         self.icons: dict = {}
 
         self.setWindowTitle(f"{APP_NAME}  ·  {BUILD}")
-        self.resize(980, 860)
+        self.resize(560, 860)
         self._build_ui()
         self._wire()
         try:  # Windows 다크/라이트 설정이 바뀌면 바로 반영 (테마 = system 일 때)
@@ -1018,7 +1018,7 @@ class MainWindow(QMainWindow):
         f.addRow(chk("stay_awake", "연결 중에는 폰이 잠들지 않게"))
         f.addRow(chk("audio", "폰 소리를 PC 스피커로 (Android 11+)"))
         f.addRow(chk("auto_mirror", "폰이 연결되면 폰 화면 자동으로 열기"))
-        f.addRow(chk("embed_mirror", "폰 화면을 런처 안('폰 화면' 탭)에 넣기 (끄면 별도 창)"))
+        f.addRow(chk("embed_mirror_exp", "(실험) 폰 화면을 런처 안에 넣기 - 클릭이 안 되면 끄세요"))
         f.addRow(chk("dock_window", "별도 창일 때 런처 옆에 붙이기"))
         f.addRow(chk("always_on_top", "폰 화면 창 항상 위"))
         f.addRow(chk("power_save", "절전 모드 (1024px · 30fps · 4Mbps로 낮춰 폰 발열·배터리 절약)"))
@@ -1475,7 +1475,7 @@ class MainWindow(QMainWindow):
             args.append(f"--new-display={vd}")
         elif self.cfg["turn_screen_off"]:
             args.append("--turn-screen-off")
-        embed = IS_WIN and self.cfg.get("embed_mirror", True)
+        embed = IS_WIN and self.cfg.get("embed_mirror_exp", False)
         if embed:
             args.append("--window-borderless")
         else:
@@ -1485,12 +1485,12 @@ class MainWindow(QMainWindow):
         if start_app:
             args.append(f"--start-app={start_app}")
         s = self._spawn(args, serial, title, "main")
-        if embed:
-            bg(self._embed_when_ready, s)
+        if IS_WIN:
+            bg(self._embed_when_ready, s, embed)
         return s
 
     # ---------------- 폰 화면을 런처 안에 넣기 (Windows) ----------------
-    def _embed_when_ready(self, s: Session):
+    def _embed_when_ready(self, s: Session, embed: bool = True):
         import ctypes
         user32 = ctypes.windll.user32
         hwnd = 0
@@ -1503,7 +1503,57 @@ class MainWindow(QMainWindow):
             time.sleep(0.1)
         if hwnd:
             time.sleep(0.3)
-            self.bus.call.emit(lambda: self._embed(s, hwnd))
+            if embed:
+                self.bus.call.emit(lambda: self._embed(s, hwnd))
+            else:
+                self.bus.call.emit(lambda: self._glue_attach(s, hwnd))
+
+    # 런처 오른쪽에 폰 화면 창을 '붙여서' 같이 움직이게 (창 자체는 그대로라 클릭/키보드가 정상 동작)
+    def _glue_attach(self, s: Session, hwnd: int):
+        if not self.cfg.get("dock_window", True):
+            return
+        import ctypes
+        user32 = ctypes.windll.user32
+        try:
+            # 소유 창으로 지정 → 런처를 최소화/앞으로 가져오면 같이 따라옴 (WS_CHILD가 아니라 입력은 정상)
+            GWLP_HWNDPARENT = -8
+            setlong = getattr(user32, "SetWindowLongPtrW", None) or user32.SetWindowLongW
+            setlong(ctypes.c_void_p(hwnd), GWLP_HWNDPARENT, ctypes.c_void_p(int(self.winId())))
+        except Exception:
+            pass
+        self._glued = (s, hwnd)
+        self._glue()
+        self.phone_hint.setText("폰 화면은 런처 오른쪽 창에 떠 있어요. 런처를 움직이면 같이 따라와요.\n\n"
+                                "'앱' 탭에서 앱을 누르면 그 앱은 PC에 새 창으로 따로 열려요.")
+
+    def _glue(self):
+        g = getattr(self, "_glued", None)
+        if not g or not IS_WIN:
+            return
+        s, hwnd = g
+        if s.proc.poll() is not None:
+            self._glued = None
+            return
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        me, other = wintypes.RECT(), wintypes.RECT()
+        if not user32.GetWindowRect(int(self.winId()), ctypes.byref(me)) or \
+                not user32.GetWindowRect(hwnd, ctypes.byref(other)):
+            return
+        h = me.bottom - me.top
+        ow, oh = other.right - other.left, other.bottom - other.top
+        w = int(h * ow / oh) if oh > 0 else ow  # 폰 화면 비율 유지
+        SWP_NOZORDER, SWP_NOACTIVATE = 0x0004, 0x0010
+        user32.SetWindowPos(hwnd, 0, me.right, me.top, w, h, SWP_NOZORDER | SWP_NOACTIVATE)
+
+    def moveEvent(self, e):
+        super().moveEvent(e)
+        self._glue()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._glue()
 
     def _embed(self, s: Session, hwnd: int):
         from PySide6.QtGui import QWindow
