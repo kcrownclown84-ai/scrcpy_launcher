@@ -392,6 +392,42 @@ class Phone:
         time.sleep(0.2)
         self.key(serial, 66)          # Enter
 
+    def pattern_points(self, serial: str) -> dict:
+        """잠금 패턴 9개 점의 화면 좌표 {1:(x,y) … 9:(x,y)} (1=왼쪽 위, 9=오른쪽 아래)."""
+        tmp = "/data/local/tmp/pl_ui.xml"
+        self.shell(serial, "uiautomator", "dump", tmp, timeout=25)
+        xml = self.shell(serial, "cat", tmp, timeout=10)
+        self.shell(serial, "rm", "-f", tmp)
+        box = None
+        for m in re.finditer(r'<node [^>]*?resource-id="([^"]*)"[^>]*?bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', xml):
+            if "pattern" in m.group(1).lower():
+                box = tuple(int(m.group(i)) for i in range(2, 6))
+                break
+        if not box:  # 못 찾으면 일반적인 위치로 추정 (화면 아래쪽 가운데 정사각형)
+            out = self.shell(serial, "wm", "size")
+            sizes = re.findall(r"(\d+)x(\d+)", out)
+            w, h = map(int, sizes[-1]) if sizes else (1080, 2340)
+            side = int(w * 0.75)
+            top = int(h * 0.80) - side
+            box = ((w - side) // 2, top, (w + side) // 2, top + side)
+        l, t, r, b = box
+        cw, ch = (r - l) / 3, (b - t) / 3
+        return {row * 3 + col + 1: (int(l + cw * (col + 0.5)), int(t + ch * (row + 0.5)))
+                for row in range(3) for col in range(3)}
+
+    def unlock_pattern(self, serial: str, seq: str) -> None:
+        """seq: '14789' 처럼 지나가는 점 번호 순서."""
+        self.key(serial, 82)  # 잠금 화면 → 패턴 입력 화면
+        time.sleep(1.0)
+        pts = self.pattern_points(serial)
+        path = [pts[int(c)] for c in seq]
+        cmds = [f"input motionevent DOWN {path[0][0]} {path[0][1]}"]
+        for (x0, y0), (x1, y1) in zip(path, path[1:]):
+            for f in (0.5, 1.0):  # 중간점을 거쳐 부드럽게 이동
+                cmds.append(f"input motionevent MOVE {int(x0 + (x1 - x0) * f)} {int(y0 + (y1 - y0) * f)}")
+        cmds.append(f"input motionevent UP {path[-1][0]} {path[-1][1]}")
+        self.shell(serial, " ; ".join(cmds), timeout=60)
+
     def force_stop(self, serial: str, package: str) -> None:
         self.shell(serial, "am", "force-stop", package)
 
@@ -695,6 +731,71 @@ def aspect_display(cfg: dict) -> str | None:
     return f"{w}x{h}/{dpi}"
 
 
+class PatternPad(QWidget):
+    """마우스로 그리는 3x3 패턴 입력판."""
+    changed = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(240, 240)
+        self.seq = ""
+        self._mouse = None
+
+    def _centers(self):
+        return {i * 3 + j + 1: (40 + j * 80, 40 + i * 80) for i in range(3) for j in range(3)}
+
+    def _hit(self, pos):
+        for n, (x, y) in self._centers().items():
+            if (pos.x() - x) ** 2 + (pos.y() - y) ** 2 <= 26 ** 2:
+                return n
+        return None
+
+    def mousePressEvent(self, e):
+        self.seq = ""
+        self._add(e.position().toPoint())
+
+    def mouseMoveEvent(self, e):
+        self._mouse = e.position().toPoint()
+        self._add(self._mouse)
+        self.update()
+
+    def mouseReleaseEvent(self, e):
+        self._mouse = None
+        self.update()
+        self.changed.emit(self.seq)
+
+    def _add(self, pos):
+        n = self._hit(pos)
+        if n and str(n) not in self.seq:
+            if self.seq:  # 일직선 사이에 낀 점은 폰처럼 자동으로 포함
+                a = int(self.seq[-1])
+                ra, ca, rb, cb = (a - 1) // 3, (a - 1) % 3, (n - 1) // 3, (n - 1) % 3
+                if (ra + rb) % 2 == 0 and (ca + cb) % 2 == 0:
+                    mid = ((ra + rb) // 2) * 3 + (ca + cb) // 2 + 1
+                    if str(mid) not in self.seq:
+                        self.seq += str(mid)
+            self.seq += str(n)
+        self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        c = self._centers()
+        from PySide6.QtGui import QPen
+        pen = QPen(QColor("#2F6FED"), 6)
+        p.setPen(pen)
+        pts = [c[int(ch)] for ch in self.seq]
+        for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+            p.drawLine(x0, y0, x1, y1)
+        if pts and self._mouse is not None:
+            p.drawLine(pts[-1][0], pts[-1][1], self._mouse.x(), self._mouse.y())
+        p.setPen(Qt.NoPen)
+        for n, (x, y) in c.items():
+            p.setBrush(QColor("#2F6FED") if str(n) in self.seq else QColor("#8A90A0"))
+            p.drawEllipse(x - 12, y - 12, 24, 24)
+        p.end()
+
+
 class WifiDialog(QDialog):
     """무선 디버깅으로 폰 연결 (페어링 + 연결)."""
     result = Signal(str, bool, str)  # 동작, 성공, 메시지
@@ -916,7 +1017,7 @@ class MainWindow(QMainWindow):
         lb = QHBoxLayout(self.lock_bar)
         lb.setContentsMargins(10, 6, 6, 6)
         lb.addWidget(QLabel("🔒 폰이 잠겨 있어요. 잠금 해제 화면은 보안 때문에 PC에서 검게 보여요."), 1)
-        btn_pin = QPushButton("PIN으로 잠금 해제")
+        btn_pin = QPushButton("패턴/PIN으로 잠금 해제")
         btn_pin.clicked.connect(self.ask_unlock)
         lb.addWidget(btn_pin)
         self.lock_bar.hide()
@@ -1132,7 +1233,7 @@ class MainWindow(QMainWindow):
         tips.setObjectName("muted")
         f.addRow(tips)
 
-        btn_forget = QPushButton("기억한 잠금 PIN 지우기")
+        btn_forget = QPushButton("기억한 잠금 패턴/PIN 지우기")
         btn_forget.setObjectName("flat")
         btn_forget.clicked.connect(lambda: (self._set("pin_saved", ""), self.statusBar().showMessage("기억한 PIN을 지웠어요.", 4000)))
         f.addRow(btn_forget)
@@ -1798,45 +1899,82 @@ class MainWindow(QMainWindow):
                 self._lock_busy = False
         bg(work)
 
+    def _unlock_dialog(self):
+        """→ ("P", "14789") 패턴 / ("N", "1234") PIN / None"""
+        d = QDialog(self)
+        d.setWindowTitle("폰 잠금 해제")
+        v = QVBoxLayout(d)
+        tabs = QTabWidget()
+        v.addWidget(tabs)
+        # 패턴
+        pw = QWidget()
+        pv = QVBoxLayout(pw)
+        pv.addWidget(QLabel("폰에서 쓰는 잠금 패턴을 그대로 그려주세요."))
+        pad = PatternPad()
+        pv.addWidget(pad, 0, Qt.AlignCenter)
+        tabs.addTab(pw, "패턴")
+        # PIN
+        nw = QWidget()
+        nv = QVBoxLayout(nw)
+        nv.addWidget(QLabel("폰 잠금 PIN(또는 비밀번호)을 입력하세요."))
+        e = QLineEdit()
+        e.setEchoMode(QLineEdit.Password)
+        nv.addWidget(e)
+        nv.addStretch(1)
+        tabs.addTab(nw, "PIN / 비밀번호")
+        if self.cfg.get("unlock_kind") == "N":
+            tabs.setCurrentIndex(1)
+
+        remember = QCheckBox("이 PC에 기억하기 (Windows 계정으로 암호화, 기본은 저장 안 함)")
+        remember.setEnabled(IS_WIN and not NO_SAVE)
+        v.addWidget(remember)
+        ok = QPushButton("잠금 해제")
+        ok.clicked.connect(d.accept)
+        e.returnPressed.connect(d.accept)
+        v.addWidget(ok)
+        if d.exec() != QDialog.Accepted:
+            return None
+        if tabs.currentIndex() == 0:
+            if len(pad.seq) < 4:
+                QMessageBox.information(self, APP_NAME, "패턴은 점 4개 이상이어야 해요.")
+                return None
+            secret = ("P", pad.seq)
+        else:
+            if not e.text():
+                return None
+            secret = ("N", e.text())
+        self.cfg["unlock_kind"] = secret[0]
+        if remember.isChecked():
+            try:
+                import base64
+                blob = dpapi(f"{secret[0]}:{secret[1]}".encode(), True)
+                self._set("pin_saved", base64.b64encode(blob).decode())
+            except Exception:
+                pass
+        return secret
+
     def ask_unlock(self):
         serial = self.current_serial()
         if not serial:
             return
-        pin = ""
+        secret = None
         if self.cfg.get("pin_saved") and IS_WIN:
             try:
                 import base64
-                pin = dpapi(base64.b64decode(self.cfg["pin_saved"]), False).decode()
+                raw = dpapi(base64.b64decode(self.cfg["pin_saved"]), False).decode()
+                kind, val = raw.split(":", 1) if ":" in raw else ("N", raw)
+                secret = (kind, val)
             except Exception:
-                pin = ""
-        remember = None
-        if not pin:
-            d = QDialog(self)
-            d.setWindowTitle("PIN으로 잠금 해제")
-            v = QVBoxLayout(d)
-            v.addWidget(QLabel("폰 잠금 PIN(또는 비밀번호)을 입력하세요.\n폰으로 바로 입력만 하고, 기억하기를 켜지 않으면 어디에도 저장하지 않아요."))
-            e = QLineEdit()
-            e.setEchoMode(QLineEdit.Password)
-            v.addWidget(e)
-            remember = QCheckBox("이 PC에 기억하기 (Windows 계정으로 암호화)")
-            remember.setEnabled(IS_WIN and not NO_SAVE)
-            v.addWidget(remember)
-            ok = QPushButton("잠금 해제")
-            ok.clicked.connect(d.accept)
-            e.returnPressed.connect(d.accept)
-            v.addWidget(ok)
-            if d.exec() != QDialog.Accepted or not e.text():
+                secret = None
+        if not secret:
+            secret = self._unlock_dialog()
+            if not secret:
                 return
-            pin = e.text()
-            if remember.isChecked():
-                try:
-                    import base64
-                    self._set("pin_saved", base64.b64encode(dpapi(pin.encode(), True)).decode())
-                except Exception:
-                    pass
-        if not re.fullmatch(r"[0-9A-Za-z]+", pin):
-            QMessageBox.warning(self, APP_NAME, "영문/숫자 PIN만 자동 입력할 수 있어요. 폰 화면 창을 클릭하고 키보드로 직접 입력해 주세요.")
+        kind, val = secret
+        if kind == "N" and not re.fullmatch(r"[0-9A-Za-z]+", val):
+            QMessageBox.warning(self, APP_NAME, "영문/숫자만 자동 입력할 수 있어요. 폰 화면 창을 클릭하고 키보드로 직접 입력해 주세요.")
             return
+        self.statusBar().showMessage("잠금 해제 중…")
 
         def work():
             try:
@@ -1844,17 +1982,19 @@ class MainWindow(QMainWindow):
                 if not was_awake:
                     self.phone.key(serial, 224)  # WAKEUP
                     time.sleep(0.8)
-                self.phone.unlock(serial, pin)
+                if kind == "P":
+                    self.phone.unlock_pattern(serial, val)
+                else:
+                    self.phone.unlock(serial, val)
                 time.sleep(1.5)
                 if self.phone.is_locked(serial):
-                    self.bus.status.emit("잠금 해제가 안 됐어요. PIN을 확인해 주세요.")
+                    self.bus.status.emit("잠금 해제가 안 됐어요. 패턴/PIN을 확인해 주세요.")
                     if self.cfg.get("pin_saved"):
                         self.bus.call.emit(lambda: self._set("pin_saved", ""))
                     return
                 self.bus.status.emit("🔓 잠금 해제됐어요.")
                 self.bus.call.emit(lambda: self.lock_bar.hide())
                 if not was_awake and self.cfg.get("turn_screen_off"):
-                    # 깨우느라 켜진 폰 화면을 다시 끄기 위해 폰 화면 창을 다시 연다
                     self.bus.call.emit(self._reopen_main)
             except Exception as ex:
                 self.bus.status.emit(f"잠금 해제 실패: {ex}")
