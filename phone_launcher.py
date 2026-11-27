@@ -67,6 +67,7 @@ DEFAULT_CONFIG = {
     "favorites": [],
     "wifi_addr": "",            # 마지막으로 무선 연결한 IP:포트
     "wifi_auto": True,          # 시작할 때 무선 자동 재연결
+    "power_save": False,        # 절전 모드: 해상도·FPS·화질을 낮춰 폰 발열/배터리 절약
 }
 
 
@@ -398,14 +399,41 @@ class Phone:
             a.append("--stay-awake")
         if not cfg["audio"]:
             a.append("--no-audio")
-        if cfg["max_size"]:
-            a.append(f"--max-size={cfg['max_size']}")
-        if cfg["max_fps"]:
-            a.append(f"--max-fps={cfg['max_fps']}")
-        a.append(f"--video-bit-rate={cfg['bitrate_mbps']}M")
+        size, fps, rate = cfg["max_size"], cfg["max_fps"], cfg["bitrate_mbps"]
+        if cfg.get("power_save"):  # 절전 모드: 인코딩 부담을 줄여 폰 발열/배터리 절약
+            size = min(size or 9999, 1024)
+            fps = min(fps or 999, 30)
+            rate = min(rate, 4)
+        if size:
+            a.append(f"--max-size={size}")
+        if fps:
+            a.append(f"--max-fps={fps}")
+        a.append(f"--video-bit-rate={rate}M")
         if cfg["always_on_top"]:
             a.append("--always-on-top")
         return a
+
+    def battery(self, serial: str) -> dict:
+        """dumpsys battery → {level, temp(°C), charging, source}"""
+        out = self.shell(serial, "dumpsys", "battery", timeout=8)
+        info = {}
+        for line in out.splitlines():
+            if ":" in line:
+                k, v = line.split(":", 1)
+                info[k.strip()] = v.strip()
+        src = [n for k, n in (("AC powered", "충전기"), ("USB powered", "USB"),
+                              ("Wireless powered", "무선충전")) if info.get(k) == "true"]
+        try:
+            temp = int(info.get("temperature", "0")) / 10
+        except ValueError:
+            temp = 0
+        return {
+            "level": info.get("level", "?"),
+            "temp": temp,
+            "charging": info.get("status") == "2",
+            "full": info.get("status") == "5",
+            "source": src[0] if src else "",
+        }
 
     def start(self, args: list[str]) -> subprocess.Popen:
         return subprocess.Popen(
@@ -451,6 +479,7 @@ class Bus(QObject):
     devices = Signal(list)
     apps = Signal(str, list)
     icons = Signal(dict)
+    battery = Signal(str, dict)
     status = Signal(str)
     error = Signal(str)
 
@@ -691,6 +720,9 @@ class MainWindow(QMainWindow):
             pass
         self._locate_tools()
 
+        self.batt_timer = QTimer(self, interval=30000, timeout=self.refresh_battery)
+        self.batt_timer.start()
+        QTimer.singleShot(1500, self.refresh_battery)
         self.poll = QTimer(self, interval=3000, timeout=self._tick)
         self.poll.start()
         self.refresh_devices()
@@ -729,6 +761,11 @@ class MainWindow(QMainWindow):
         top.addWidget(btn_wifi)
         top.addWidget(self.btn_mirror)
         v.addLayout(top)
+
+        self.batt = QLabel("")
+        self.batt.setObjectName("muted")
+        self.batt.setToolTip("폰 배터리·충전·온도 (30초마다 갱신)")
+        v.addWidget(self.batt)
 
         self.tabs = QTabWidget()
         v.addWidget(self.tabs, 1)
@@ -868,6 +905,7 @@ class MainWindow(QMainWindow):
         f.addRow(chk("audio", "폰 소리를 PC 스피커로 (Android 11+)"))
         f.addRow(chk("dock_window", "폰 화면 창을 런처 옆에 붙이기"))
         f.addRow(chk("always_on_top", "폰 화면 창 항상 위"))
+        f.addRow(chk("power_save", "절전 모드 (1024px · 30fps · 4Mbps로 낮춰 폰 발열·배터리 절약)"))
         f.addRow(chk("separate_windows", "앱마다 새 창으로 열기 (가상 디스플레이, Android 10+)"))
 
         def spin(key, lo, hi, step, suffix):
@@ -908,11 +946,12 @@ class MainWindow(QMainWindow):
         self.bus.devices.connect(self._on_devices)
         self.bus.apps.connect(self._on_apps)
         self.bus.icons.connect(self._on_icons)
+        self.bus.battery.connect(self._on_battery)
         self.bus.status.connect(lambda m: self.statusBar().showMessage(m, 6000))
         self.bus.error.connect(lambda m: QMessageBox.warning(self, APP_NAME, m))
         self.search.textChanged.connect(self._render_apps)
         self.chk_system.toggled.connect(lambda v: (self._set("show_system_apps", v), self._render_apps()))
-        self.dev_combo.currentIndexChanged.connect(lambda _: (self.refresh_apps(), self._update_mirror_btn()))
+        self.dev_combo.currentIndexChanged.connect(lambda _: (self.refresh_apps(), self._update_mirror_btn(), self.refresh_battery()))
         for lst in (self.app_list, self.fav_list):
             lst.itemClicked.connect(self._on_app_clicked)
             lst.customContextMenuRequested.connect(lambda pos, l=lst: self._app_menu(l, pos))
@@ -1276,6 +1315,39 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.bus.status.emit(f"오류: {e}")
             return default
+
+    # ---------------- 배터리/발열 ----------------
+    def refresh_battery(self):
+        serial = self.current_serial()
+        if not serial or not self.phone.adb:
+            self.batt.setText("")
+            return
+
+        def work():
+            try:
+                self.bus.battery.emit(serial, self.phone.battery(serial))
+            except Exception:
+                pass
+        bg(work)
+
+    def _on_battery(self, serial: str, b: dict):
+        if serial != self.current_serial():
+            return
+        if b["full"]:
+            charge = "충전 완료"
+        elif b["charging"]:
+            charge = f"⚡ 충전 중 ({b['source']})" if b["source"] else "⚡ 충전 중"
+        else:
+            charge = "배터리 사용 중"
+        t = b["temp"]
+        if t >= 45:
+            color, warn = "#EB5757", "  ⚠ 너무 뜨거워요! 폰 화면 창을 닫고 식혀주세요"
+        elif t >= 40:
+            color, warn = "#F2994A", "  ⚠ 조금 뜨거워요 (설정 → 절전 모드 추천)"
+        else:
+            color, warn = "", ""
+        temp = f"<span style='color:{color}'>🌡 {t:.1f}°C{warn}</span>" if color else f"🌡 {t:.1f}°C"
+        self.batt.setText(f"🔋 {b['level']}%  ·  {charge}  ·  {temp}")
 
     def _tick(self):
         self.refresh_devices()

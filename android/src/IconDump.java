@@ -1,7 +1,9 @@
 // 폰에서 app_process 로 실행되는 작은 도우미: 패키지명들을 받아 앱 아이콘을 PNG(base64)로 출력.
 // 사용: CLASSPATH=/data/local/tmp/pl_icons.jar app_process / IconDump <size> <pkg> [pkg...]
 // 출력: 한 줄에 "<pkg> <base64 png>"  (실패하면 "<pkg> -")
+import android.app.Application;
 import android.content.Context;
+import android.content.ContextWrapper;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
@@ -28,7 +30,20 @@ public final class IconDump {
         cur.set(null, thread);
         Method m = at.getDeclaredMethod("getSystemContext");
         m.setAccessible(true);
-        return (Context) m.invoke(thread);
+        Context ctx = (Context) m.invoke(thread);
+        // AdaptiveIconDrawable 등은 ActivityThread.currentApplication() 이 필요 → 가짜 Application 연결
+        try {
+            Application app = Application.class.newInstance();
+            Method attach = ContextWrapper.class.getDeclaredMethod("attachBaseContext", Context.class);
+            attach.setAccessible(true);
+            attach.invoke(app, ctx);
+            Field init = at.getDeclaredField("mInitialApplication");
+            init.setAccessible(true);
+            init.set(thread, app);
+        } catch (Throwable t) {
+            if (System.getenv("ICONDUMP_DEBUG") != null) t.printStackTrace();
+        }
+        return ctx;
     }
 
     public static void main(String[] args) throws Exception {
