@@ -42,14 +42,9 @@ jobs:
           - api: 34
             target: google_apis
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
       - uses: actions/download-artifact@v4
         with:
           name: iconhelper
-      - run: sudo apt-get install -y -q libegl1 libxkbcommon0 >/dev/null && pip install -q PySide6
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -69,7 +64,6 @@ jobs:
             grep -q '^no.such.app - ' icons.txt
             grep '^com.android.settings iVBOR' icons.txt | cut -d' ' -f2 | base64 -d > settings.png && ls -la settings.png
             echo "ICON HELPER OK"
-            QT_QPA_PLATFORM=offscreen python3 tests/emu_unlock.py
 
   build:
     needs: icon-helper

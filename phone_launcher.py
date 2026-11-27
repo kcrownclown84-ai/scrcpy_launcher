@@ -64,7 +64,7 @@ DEFAULT_CONFIG = {
     "bitrate_mbps": 8,
     "always_on_top": False,
     "dock_window": True,        # scrcpy 창을 런처 옆에 붙이기
-    "separate_windows": True,   # 앱 목록에서 실행하면 새 창(가상 디스플레이)으로
+    "separate_windows": False,  # 앱마다 새 창(가상 디스플레이)
     "virtual_size": "1080x1920/420",
     "aspect": "phone",          # 폰 화면 창 비율: phone(그대로 미러링) | 16:9 | 16:10 | 4:3 | 21:9 | custom
     "aspect_landscape": True,   # 가로 방향
@@ -74,9 +74,6 @@ DEFAULT_CONFIG = {
     "favorites": [],
     "wifi_addr": "",            # 마지막으로 무선 연결한 IP:포트
     "wifi_auto": True,          # 시작할 때 무선 자동 재연결
-    "embed_mirror_exp": False,  # (실험) 폰 화면을 런처 안에 넣기 - 일부 PC에서 클릭이 안 먹어서 기본 꺼짐
-    "auto_mirror": True,        # 폰이 연결되면 폰 화면 자동으로 열기
-    "pin_saved": "",            # (선택) DPAPI로 암호화한 잠금 PIN (base64)
     "power_save": False,        # 절전 모드: 해상도·FPS·화질을 낮춰 폰 발열/배터리 절약
 }
 
@@ -118,25 +115,6 @@ def delete_saved_config() -> None:
         LEGACY_CONFIG.unlink()
     except Exception:
         pass
-
-
-def dpapi(data: bytes, protect: bool) -> bytes:
-    """Windows DPAPI로 현재 Windows 사용자만 풀 수 있게 암호화/복호화."""
-    import ctypes
-    from ctypes import wintypes
-
-    class BLOB(ctypes.Structure):
-        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
-    buf = ctypes.create_string_buffer(data, len(data))
-    src, out = BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char))), BLOB()
-    crypt32 = ctypes.windll.crypt32
-    fn = crypt32.CryptProtectData if protect else crypt32.CryptUnprotectData
-    if not fn(ctypes.byref(src), None, None, None, None, 0, ctypes.byref(out)):
-        raise OSError("DPAPI 실패")
-    try:
-        return ctypes.string_at(out.pbData, out.cbData)
-    finally:
-        ctypes.windll.kernel32.LocalFree(out.pbData)
 
 
 def find_scrcpy(custom: str = "") -> str | None:
@@ -206,7 +184,6 @@ class Session:
     kind: str  # "main" | "app"
     started: float = field(default_factory=time.time)
     display_id: int | None = None  # 가상 디스플레이 번호 (비율 모드)
-    embedded: bool = False
 
 
 class Phone:
@@ -356,6 +333,11 @@ class Phone:
     def key(self, serial: str, keycode: int | str) -> None:
         self.shell(serial, "input", "keyevent", str(keycode))
 
+    def is_awake(self, serial: str) -> bool:
+        out = self.shell(serial, "dumpsys", "power", timeout=8)
+        m = re.search(r"mWakefulness=(\w+)", out)
+        return not m or m.group(1) == "Awake"
+
     def launch_via_adb(self, serial: str, package: str) -> None:
         self.shell(serial, "monkey", "-p", package, "-c",
                    "android.intent.category.LAUNCHER", "1")
@@ -369,66 +351,6 @@ class Phone:
         r = self.shell(serial, "am", "start", "--display", str(display_id),
                        "-f", "0x10000000", "-n", comp)
         return "Error" not in r
-
-    LOCK_RE = re.compile(r"(mShowingLockscreen|mDreamingLockscreen|isStatusBarKeyguard|"
-                         r"mIsShowing|keyguardShowing|KeyguardShowing)\s*[=:]\s*true", re.I)
-
-    def is_locked(self, serial: str) -> bool:
-        out = self.shell(serial, "dumpsys", "window", "policy", timeout=8)
-        if not out.strip():
-            out = self.shell(serial, "dumpsys", "window", timeout=8)
-        return bool(self.LOCK_RE.search(out))
-
-    def is_awake(self, serial: str) -> bool:
-        out = self.shell(serial, "dumpsys", "power", timeout=8)
-        m = re.search(r"mWakefulness=(\w+)", out)
-        return not m or m.group(1) == "Awake"
-
-    def unlock(self, serial: str, pin: str) -> None:
-        """잠금 해제: (필요하면 깨우고) 잠금 화면 올리고 PIN 입력 + 확인."""
-        self.key(serial, 82)          # 잠금 화면 → PIN 입력 화면
-        time.sleep(0.6)
-        self.shell(serial, "input", "text", pin)
-        time.sleep(0.2)
-        self.key(serial, 66)          # Enter
-
-    def pattern_points(self, serial: str) -> dict:
-        """잠금 패턴 9개 점의 화면 좌표 {1:(x,y) … 9:(x,y)} (1=왼쪽 위, 9=오른쪽 아래)."""
-        tmp = "/data/local/tmp/pl_ui.xml"
-        self.pattern_debug = self.shell(serial, "uiautomator", "dump", tmp, timeout=25)
-        xml = self.shell(serial, "cat", tmp, timeout=10)
-        self.pattern_xml = xml
-        self.shell(serial, "rm", "-f", tmp)
-        box = None
-        for m in re.finditer(r'<node [^>]*?resource-id="([^"]*)"[^>]*?bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', xml):
-            if "pattern" in m.group(1).lower():
-                box = tuple(int(m.group(i)) for i in range(2, 6))
-                self.pattern_debug += f" found {m.group(1)} {box}"
-                break
-        if not box:  # 못 찾으면 일반적인 위치로 추정 (화면 아래쪽 가운데 정사각형)
-            out = self.shell(serial, "wm", "size")
-            sizes = re.findall(r"(\d+)x(\d+)", out)
-            w, h = map(int, sizes[-1]) if sizes else (1080, 2340)
-            side = int(w * 0.75)
-            top = int(h * 0.80) - side
-            box = ((w - side) // 2, top, (w + side) // 2, top + side)
-        l, t, r, b = box
-        cw, ch = (r - l) / 3, (b - t) / 3
-        return {row * 3 + col + 1: (int(l + cw * (col + 0.5)), int(t + ch * (row + 0.5)))
-                for row in range(3) for col in range(3)}
-
-    def unlock_pattern(self, serial: str, seq: str) -> None:
-        """seq: '14789' 처럼 지나가는 점 번호 순서."""
-        self.key(serial, 82)  # 잠금 화면 → 패턴 입력 화면
-        time.sleep(1.0)
-        pts = self.pattern_points(serial)
-        path = [pts[int(c)] for c in seq]
-        cmds = [f"input motionevent DOWN {path[0][0]} {path[0][1]}"]
-        for (x0, y0), (x1, y1) in zip(path, path[1:]):
-            for f in (0.5, 1.0):  # 중간점을 거쳐 부드럽게 이동
-                cmds.append(f"input motionevent MOVE {int(x0 + (x1 - x0) * f)} {int(y0 + (y1 - y0) * f)}")
-        cmds.append(f"input motionevent UP {path[-1][0]} {path[-1][1]}")
-        self.shell(serial, " ; ".join(cmds), timeout=60)
 
     def force_stop(self, serial: str, package: str) -> None:
         self.shell(serial, "am", "force-stop", package)
@@ -461,7 +383,6 @@ class Phone:
         self.ensure_server()
         r = run([self.adb, "-s", serial, "push", str(ICON_HELPER), self.REMOTE_HELPER], timeout=30)
         if r.returncode != 0:
-            self.icon_error = "push 실패: " + (r.stdout + r.stderr).decode("utf-8", "replace").strip()[:300]
             return
         try:
             for i in range(0, len(pkgs), chunk):
@@ -476,8 +397,6 @@ class Phone:
                             got[bits[0]] = base64.b64decode(bits[1])
                         except Exception:
                             pass
-                if not got:
-                    self.icon_error = (r.stdout + r.stderr).decode("utf-8", "replace").strip()[:300]
                 yield got
         finally:
             try:
@@ -527,7 +446,7 @@ class Phone:
             for pkg in launchable:
                 nice = pkg.split(".")[-1].capitalize()
                 apps.append(AppInfo(pkg, nice, pkg not in user))
-        # 실행 가능한 앱(홈 화면에 아이콘이 있는 앱)만 기본으로 보여주기 (삼성 기본 앱 포함)
+        # 홈 화면에 아이콘이 있는 앱은 시스템 앱(삼성 기본 앱 등)이어도 보여주기
         try:
             out = self.shell(serial, "cmd", "package", "query-activities", "--brief",
                              "-a", "android.intent.action.MAIN", "-c", "android.intent.category.LAUNCHER",
@@ -537,7 +456,7 @@ class Phone:
                 known = {a.package for a in apps}
                 for a in apps:
                     a.launchable = a.package in launch
-                for pkg in launch - known:  # 목록에 없던 앱 추가
+                for pkg in launch - known:
                     apps.append(AppInfo(pkg, pkg.split(".")[-1].capitalize(), False, True))
         except Exception:
             pass
@@ -632,6 +551,7 @@ class Bus(QObject):
     apps = Signal(str, list)
     icons = Signal(dict)
     battery = Signal(str, dict)
+    call = Signal(object)
     call = Signal(object)  # 백그라운드 스레드에서 UI 스레드로 함수 실행 요청
     status = Signal(str)
     error = Signal(str)
@@ -731,71 +651,6 @@ def aspect_display(cfg: dict) -> str | None:
         w, h = h, w
     dpi = max(160, min(480, int(min(w, h) / 1080 * 280)))  # 글자가 너무 작지 않게
     return f"{w}x{h}/{dpi}"
-
-
-class PatternPad(QWidget):
-    """마우스로 그리는 3x3 패턴 입력판."""
-    changed = Signal(str)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFixedSize(240, 240)
-        self.seq = ""
-        self._mouse = None
-
-    def _centers(self):
-        return {i * 3 + j + 1: (40 + j * 80, 40 + i * 80) for i in range(3) for j in range(3)}
-
-    def _hit(self, pos):
-        for n, (x, y) in self._centers().items():
-            if (pos.x() - x) ** 2 + (pos.y() - y) ** 2 <= 26 ** 2:
-                return n
-        return None
-
-    def mousePressEvent(self, e):
-        self.seq = ""
-        self._add(e.position().toPoint())
-
-    def mouseMoveEvent(self, e):
-        self._mouse = e.position().toPoint()
-        self._add(self._mouse)
-        self.update()
-
-    def mouseReleaseEvent(self, e):
-        self._mouse = None
-        self.update()
-        self.changed.emit(self.seq)
-
-    def _add(self, pos):
-        n = self._hit(pos)
-        if n and str(n) not in self.seq:
-            if self.seq:  # 일직선 사이에 낀 점은 폰처럼 자동으로 포함
-                a = int(self.seq[-1])
-                ra, ca, rb, cb = (a - 1) // 3, (a - 1) % 3, (n - 1) // 3, (n - 1) % 3
-                if (ra + rb) % 2 == 0 and (ca + cb) % 2 == 0:
-                    mid = ((ra + rb) // 2) * 3 + (ca + cb) // 2 + 1
-                    if str(mid) not in self.seq:
-                        self.seq += str(mid)
-            self.seq += str(n)
-        self.update()
-
-    def paintEvent(self, e):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        c = self._centers()
-        from PySide6.QtGui import QPen
-        pen = QPen(QColor("#2F6FED"), 6)
-        p.setPen(pen)
-        pts = [c[int(ch)] for ch in self.seq]
-        for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
-            p.drawLine(x0, y0, x1, y1)
-        if pts and self._mouse is not None:
-            p.drawLine(pts[-1][0], pts[-1][1], self._mouse.x(), self._mouse.y())
-        p.setPen(Qt.NoPen)
-        for n, (x, y) in c.items():
-            p.setBrush(QColor("#2F6FED") if str(n) in self.seq else QColor("#8A90A0"))
-            p.drawEllipse(x - 12, y - 12, 24, 24)
-        p.end()
 
 
 class WifiDialog(QDialog):
@@ -957,7 +812,7 @@ class MainWindow(QMainWindow):
         self.icons: dict = {}
 
         self.setWindowTitle(f"{APP_NAME}  ·  {BUILD}")
-        self.resize(560, 860)
+        self.resize(560, 760)
         self._build_ui()
         self._wire()
         try:  # Windows 다크/라이트 설정이 바뀌면 바로 반영 (테마 = system 일 때)
@@ -1014,31 +869,8 @@ class MainWindow(QMainWindow):
         self.batt.setToolTip("폰 배터리·충전·온도 (30초마다 갱신)")
         v.addWidget(self.batt)
 
-        self.lock_bar = QFrame()
-        self.lock_bar.setStyleSheet("QFrame{background:#4A3A12;border-radius:8px;} QLabel{background:transparent;color:#FFD98A;}")
-        lb = QHBoxLayout(self.lock_bar)
-        lb.setContentsMargins(10, 6, 6, 6)
-        lb.addWidget(QLabel("🔒 폰이 잠겨 있어요. 잠금 해제 화면은 보안 때문에 PC에서 검게 보여요."), 1)
-        btn_pin = QPushButton("패턴/PIN으로 잠금 해제")
-        btn_pin.clicked.connect(self.ask_unlock)
-        lb.addWidget(btn_pin)
-        self.lock_bar.hide()
-        v.addWidget(self.lock_bar)
-
         self.tabs = QTabWidget()
         v.addWidget(self.tabs, 1)
-
-        # 탭0: 폰 화면 (실제 폰 화면을 그대로 미러링)
-        self.phone_tab = QWidget()
-        self.phone_lay = QVBoxLayout(self.phone_tab)
-        self.phone_lay.setContentsMargins(0, 8, 0, 0)
-        self.phone_hint = QLabel("폰을 연결하면 여기에 폰 화면이 나와요.\n\n"
-                                 "'앱' 탭에서 앱을 누르면 그 앱은 PC에 새 창으로 따로 열려요.")
-        self.phone_hint.setAlignment(Qt.AlignCenter)
-        self.phone_hint.setObjectName("muted")
-        self.phone_lay.addWidget(self.phone_hint, 1)
-        self.embed_box = None
-        self.tabs.addTab(self.phone_tab, "폰 화면")
 
         # 탭1: 앱
         apps_tab = QWidget()
@@ -1123,7 +955,7 @@ class MainWindow(QMainWindow):
             ("📷", "스크린샷 (사진 폴더에 저장)", self._screenshot),
             ("🔔", "알림창 내리기", lambda s: self.phone.shell(s, "cmd", "statusbar", "expand-notifications")),
             None,
-            ("⏻", "전원 버튼 (폰 화면 켜기/끄기)", lambda s: self.phone.key(s, 26)),
+            ("⏻", "폰 화면 켜기/끄기 (PC 창은 계속 보여요)", lambda s: self.bus_call(self.toggle_panel)),
         ]
         for b in buttons:
             if b is None:
@@ -1173,12 +1005,10 @@ class MainWindow(QMainWindow):
         f.addRow(chk("turn_screen_off", "폰 화면 끄고 사용 (PC에만 표시)"))
         f.addRow(chk("stay_awake", "연결 중에는 폰이 잠들지 않게"))
         f.addRow(chk("audio", "폰 소리를 PC 스피커로 (Android 11+)"))
-        f.addRow(chk("auto_mirror", "폰이 연결되면 폰 화면 자동으로 열기"))
-        f.addRow(chk("embed_mirror_exp", "(실험) 폰 화면을 런처 안에 넣기 - 클릭이 안 되면 끄세요"))
-        f.addRow(chk("dock_window", "별도 창일 때 런처 옆에 붙이기"))
+        f.addRow(chk("dock_window", "폰 화면 창을 런처 옆에 붙이기"))
         f.addRow(chk("always_on_top", "폰 화면 창 항상 위"))
         f.addRow(chk("power_save", "절전 모드 (1024px · 30fps · 4Mbps로 낮춰 폰 발열·배터리 절약)"))
-        f.addRow(chk("separate_windows", "앱 탭에서 실행한 앱은 새 창으로 열기 (가상 디스플레이, Android 10+)"))
+        f.addRow(chk("separate_windows", "앱마다 새 창으로 열기 (가상 디스플레이, Android 10+)"))
 
         def spin(key, lo, hi, step, suffix):
             sb = QSpinBox(minimum=lo, maximum=hi, singleStep=step, suffix=suffix)
@@ -1235,11 +1065,6 @@ class MainWindow(QMainWindow):
         tips.setObjectName("muted")
         f.addRow(tips)
 
-        btn_forget = QPushButton("기억한 잠금 패턴/PIN 지우기")
-        btn_forget.setObjectName("flat")
-        btn_forget.clicked.connect(lambda: (self._set("pin_saved", ""), self.statusBar().showMessage("기억한 PIN을 지웠어요.", 4000)))
-        f.addRow(btn_forget)
-
         btn_diag = QPushButton("앱 아이콘 다시 받기 + 진단")
         btn_diag.setObjectName("flat")
         btn_diag.clicked.connect(self.icon_diagnose)
@@ -1262,6 +1087,7 @@ class MainWindow(QMainWindow):
         self.bus.apps.connect(self._on_apps)
         self.bus.icons.connect(self._on_icons)
         self.bus.battery.connect(self._on_battery)
+        self.bus.call.connect(lambda fn: fn())
         self.bus.call.connect(lambda fn: fn())
         self.bus.status.connect(lambda m: self.statusBar().showMessage(m, 6000))
         self.bus.error.connect(lambda m: QMessageBox.warning(self, APP_NAME, m))
@@ -1397,11 +1223,6 @@ class MainWindow(QMainWindow):
         self._update_mirror_btn()
         self.refresh_apps()
         self.refresh_battery()
-        serial = self.current_serial()
-        if serial and self.cfg.get("auto_mirror", True) and self.phone.scrcpy \
-                and not self._main_session(serial) and serial not in getattr(self, "_auto_opened", set()):
-            self._auto_opened = getattr(self, "_auto_opened", set()) | {serial}
-            QTimer.singleShot(500, lambda: self.current_serial() == serial and self.open_main(serial))
 
     # ---------------- 앱 목록 ----------------
     def refresh_apps(self):
@@ -1446,14 +1267,9 @@ class MainWindow(QMainWindow):
                         missing.append(a.package)
                 if cached:
                     self.bus.icons.emit(cached)
-                if missing and not ICON_HELPER.is_file():
-                    self.bus.status.emit("이 버전에는 아이콘 도우미가 없어요 (GitHub 릴리스의 exe를 쓰세요)")
                 if missing and ICON_HELPER.is_file():
                     self.bus.status.emit(f"폰에서 앱 아이콘 가져오는 중… ({len(missing)}개)")
-                    total = 0
-                    self.phone.icon_error = ""
                     for got in self.phone.fetch_icons(serial, missing):
-                        total += len(got)
                         if not got:
                             continue
                         if not NO_SAVE:
@@ -1464,11 +1280,7 @@ class MainWindow(QMainWindow):
                             except Exception:
                                 pass
                         self.bus.icons.emit(got)
-                    if total:
-                        self.bus.status.emit(f"앱 아이콘 {total}개를 가져왔어요.")
-                    else:
-                        self.bus.status.emit("앱 아이콘을 못 가져왔어요. 설정 → '앱 아이콘 다시 받기 + 진단'을 눌러주세요. "
-                                             + getattr(self.phone, "icon_error", "")[:120])
+                    self.bus.status.emit("앱 아이콘을 다 가져왔어요.")
             except Exception as e:
                 self.bus.status.emit(f"아이콘 가져오기 실패: {e}")
             finally:
@@ -1575,7 +1387,7 @@ class MainWindow(QMainWindow):
     def _require(self) -> str | None:
         if not self.phone.scrcpy:
             QMessageBox.warning(self, APP_NAME, "scrcpy를 찾지 못했어요.\n설정 탭에서 scrcpy.exe 위치를 지정해주세요.")
-            self.tabs.setCurrentIndex(3)
+            self.tabs.setCurrentIndex(2)
             return None
         s = self.current_serial()
         if not s:
@@ -1636,110 +1448,12 @@ class MainWindow(QMainWindow):
             args.append(f"--new-display={vd}")
         elif self.cfg["turn_screen_off"]:
             args.append("--turn-screen-off")
-        embed = IS_WIN and self.cfg.get("embed_mirror_exp", False)
-        if embed:
-            args.append("--window-borderless")
-        else:
-            args += self._dock_args()
+        args += self._dock_args()
         title = f"{APP_NAME} - {self._device_name(serial)}"
         args.append(f"--window-title={title}")
         if start_app:
             args.append(f"--start-app={start_app}")
-        s = self._spawn(args, serial, title, "main")
-        if IS_WIN:
-            bg(self._embed_when_ready, s, embed)
-        return s
-
-    # ---------------- 폰 화면을 런처 안에 넣기 (Windows) ----------------
-    def _embed_when_ready(self, s: Session, embed: bool = True):
-        import ctypes
-        user32 = ctypes.windll.user32
-        hwnd = 0
-        for _ in range(150):  # 최대 15초 동안 scrcpy 창이 뜨길 기다림
-            if s.proc.poll() is not None:
-                return
-            hwnd = user32.FindWindowW(None, s.title)
-            if hwnd:
-                break
-            time.sleep(0.1)
-        if hwnd:
-            time.sleep(0.3)
-            if embed:
-                self.bus.call.emit(lambda: self._embed(s, hwnd))
-            else:
-                self.bus.call.emit(lambda: self._glue_attach(s, hwnd))
-
-    # 런처 오른쪽에 폰 화면 창을 '붙여서' 같이 움직이게 (창 자체는 그대로라 클릭/키보드가 정상 동작)
-    def _glue_attach(self, s: Session, hwnd: int):
-        if not self.cfg.get("dock_window", True):
-            return
-        import ctypes
-        user32 = ctypes.windll.user32
-        try:
-            # 소유 창으로 지정 → 런처를 최소화/앞으로 가져오면 같이 따라옴 (WS_CHILD가 아니라 입력은 정상)
-            GWLP_HWNDPARENT = -8
-            setlong = getattr(user32, "SetWindowLongPtrW", None) or user32.SetWindowLongW
-            setlong(ctypes.c_void_p(hwnd), GWLP_HWNDPARENT, ctypes.c_void_p(int(self.winId())))
-        except Exception:
-            pass
-        self._glued = (s, hwnd)
-        self._glue()
-        self.phone_hint.setText("폰 화면은 런처 오른쪽 창에 떠 있어요. 런처를 움직이면 같이 따라와요.\n\n"
-                                "'앱' 탭에서 앱을 누르면 그 앱은 PC에 새 창으로 따로 열려요.")
-
-    def _glue(self):
-        g = getattr(self, "_glued", None)
-        if not g or not IS_WIN:
-            return
-        s, hwnd = g
-        if s.proc.poll() is not None:
-            self._glued = None
-            return
-        import ctypes
-        from ctypes import wintypes
-        user32 = ctypes.windll.user32
-        me, other = wintypes.RECT(), wintypes.RECT()
-        if not user32.GetWindowRect(int(self.winId()), ctypes.byref(me)) or \
-                not user32.GetWindowRect(hwnd, ctypes.byref(other)):
-            return
-        h = me.bottom - me.top
-        ow, oh = other.right - other.left, other.bottom - other.top
-        w = int(h * ow / oh) if oh > 0 else ow  # 폰 화면 비율 유지
-        SWP_NOZORDER, SWP_NOACTIVATE = 0x0004, 0x0010
-        user32.SetWindowPos(hwnd, 0, me.right, me.top, w, h, SWP_NOZORDER | SWP_NOACTIVATE)
-
-    def moveEvent(self, e):
-        super().moveEvent(e)
-        self._glue()
-
-    def resizeEvent(self, e):
-        super().resizeEvent(e)
-        self._glue()
-
-    def _embed(self, s: Session, hwnd: int):
-        from PySide6.QtGui import QWindow
-        try:
-            self._unembed()
-            win = QWindow.fromWinId(hwnd)
-            box = QWidget.createWindowContainer(win, self.phone_tab)
-            box.setFocusPolicy(Qt.StrongFocus)
-            self.phone_hint.hide()
-            self.phone_lay.addWidget(box, 1)
-            self.embed_box = box
-            s.embedded = True
-            self.tabs.setCurrentIndex(0)
-            box.setFocus()
-        except Exception as e:  # 실패하면 별도 창으로 그대로 둠
-            self.statusBar().showMessage(f"폰 화면을 안에 넣지 못해 별도 창으로 띄웠어요: {e}", 8000)
-
-    def _unembed(self):
-        if self.embed_box is not None:
-            self.phone_lay.removeWidget(self.embed_box)
-            self.embed_box.hide()
-            self.embed_box.setParent(None)
-            self.embed_box.deleteLater()
-            self.embed_box = None
-        self.phone_hint.show()
+        return self._spawn(args, serial, title, "main")
 
     def launch(self, pkg: str, name: str, separate: bool | None = None, restart: bool = False):
         serial = self._require()
@@ -1801,9 +1515,6 @@ class MainWindow(QMainWindow):
             self.bus.error.emit(f"'{s.title}' 창을 열지 못했어요.\n\n{tail}")
 
     def _render_sessions(self):
-        if self.embed_box is not None and not any(
-                s.embedded and s.proc.poll() is None for s in self.sessions):
-            self._unembed()
         self.sessions = [s for s in self.sessions if s.proc.poll() is None]
         self.run_list.clear()
         for s in self.sessions:
@@ -1811,7 +1522,7 @@ class MainWindow(QMainWindow):
             it = QListWidgetItem(f"{'🖥' if s.kind == 'main' else '🪟'}  {s.title}   ·  {kind}  ·  {s.serial}")
             it.setData(Qt.UserRole, id(s))
             self.run_list.addItem(it)
-        self.tabs.setTabText(2, f"실행 중 ({len(self.sessions)})" if self.sessions else "실행 중")
+        self.tabs.setTabText(1, f"실행 중 ({len(self.sessions)})" if self.sessions else "실행 중")
 
     def stop_selected(self):
         for it in self.run_list.selectedItems():
@@ -1883,127 +1594,75 @@ class MainWindow(QMainWindow):
         temp = f"<span style='color:{color}'>🌡 {t:.1f}°C{warn}</span>" if color else f"🌡 {t:.1f}°C"
         self.batt.setText(f"🔋 {b['level']}%  ·  {charge}  ·  {temp}")
 
-    def _check_lock(self):
+    # ---------------- 폰 본체 화면 끄기/켜기 (scrcpy 방식: 폰은 깨어 있고 화면 패널만 끔) ----------------
+    def bus_call(self, fn):
+        self.bus.call.emit(fn)  # 어느 스레드에서 불러도 UI 스레드에서 실행
+
+    _ui = bus_call
+
+    def _send_scrcpy_keys(self, s: Session, shift: bool) -> bool:
+        """폰 화면 창에 Alt+O(끄기) / Alt+Shift+O(켜기)를 보낸다. 창을 앞으로 못 가져오면 False."""
+        if not IS_WIN:
+            return False
+        import ctypes
+        user32 = ctypes.windll.user32
+        hwnd = user32.FindWindowW(None, s.title)
+        if not hwnd:
+            return False
+        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        user32.SetForegroundWindow(hwnd)
+        time.sleep(0.15)
+        if user32.GetForegroundWindow() != hwnd:
+            return False  # 엉뚱한 창에 단축키가 가지 않게
+        VK_MENU, VK_SHIFT, VK_O, UP = 0x12, 0x10, 0x4F, 0x0002
+        keys = [VK_MENU] + ([VK_SHIFT] if shift else []) + [VK_O]
+        for k in keys:
+            user32.keybd_event(k, 0, 0, 0)
+        for k in reversed(keys):
+            user32.keybd_event(k, 0, UP, 0)
+        return True
+
+    def toggle_panel(self):
         serial = self.current_serial()
-        if not serial or not self._main_session(serial) or getattr(self, "_lock_busy", False):
-            if not (serial and self._main_session(serial)):
-                self.lock_bar.hide()
+        s = serial and self._main_session(serial)
+        if not s:
+            self.statusBar().showMessage("먼저 '폰 화면 열기'를 눌러주세요.", 4000)
             return
-        self._lock_busy = True
+        turn_on = getattr(s, "panel_off", bool(self.cfg["turn_screen_off"]))
+        if self._send_scrcpy_keys(s, shift=turn_on):
+            s.panel_off = not turn_on
+            self.statusBar().showMessage("폰 화면을 켰어요." if turn_on else "폰 화면을 껐어요. PC에서는 계속 보여요.", 4000)
+        else:
+            self.statusBar().showMessage("폰 화면 창을 클릭한 뒤 Alt+O(끄기) / Alt+Shift+O(켜기)를 눌러주세요.", 6000)
+
+    def _keep_awake_watch(self):
+        """폰 전원 버튼을 눌러 폰이 잠들면 PC 화면이 까매짐 → 깨우고 폰 화면 창을 다시 열어 화면 끄기를 다시 적용."""
+        serial = self.current_serial()
+        s = serial and self._main_session(serial)
+        if not s or getattr(self, "_watch_busy", False) or time.time() - s.started < 6:
+            return
+        self._watch_busy = True
 
         def work():
             try:
-                locked = self.phone.is_locked(serial)
-                self.bus.call.emit(lambda: self.lock_bar.setVisible(locked))
+                if not self.phone.is_awake(serial):
+                    self.phone.key(serial, 224)  # WAKEUP
+                    self.bus.status.emit("폰이 잠들어서 다시 깨웠어요 (폰 전원 버튼 대신 런처의 ⏻ 버튼을 쓰세요).")
+                    s.proc.terminate()
+                    try:
+                        s.proc.wait(timeout=4)
+                    except Exception:
+                        pass
+                    time.sleep(0.8)
+                    self._ui(lambda: (self.open_main(serial), self._update_mirror_btn()))
             except Exception:
                 pass
             finally:
-                self._lock_busy = False
-        bg(work)
-
-    def _unlock_dialog(self):
-        """→ ("P", "14789") 패턴 / ("N", "1234") PIN / None"""
-        d = QDialog(self)
-        d.setWindowTitle("폰 잠금 해제")
-        v = QVBoxLayout(d)
-        tabs = QTabWidget()
-        v.addWidget(tabs)
-        # 패턴
-        pw = QWidget()
-        pv = QVBoxLayout(pw)
-        pv.addWidget(QLabel("폰에서 쓰는 잠금 패턴을 그대로 그려주세요."))
-        pad = PatternPad()
-        pv.addWidget(pad, 0, Qt.AlignCenter)
-        tabs.addTab(pw, "패턴")
-        # PIN
-        nw = QWidget()
-        nv = QVBoxLayout(nw)
-        nv.addWidget(QLabel("폰 잠금 PIN(또는 비밀번호)을 입력하세요."))
-        e = QLineEdit()
-        e.setEchoMode(QLineEdit.Password)
-        nv.addWidget(e)
-        nv.addStretch(1)
-        tabs.addTab(nw, "PIN / 비밀번호")
-        if self.cfg.get("unlock_kind") == "N":
-            tabs.setCurrentIndex(1)
-
-        remember = QCheckBox("이 PC에 기억하기 (Windows 계정으로 암호화, 기본은 저장 안 함)")
-        remember.setEnabled(IS_WIN and not NO_SAVE)
-        v.addWidget(remember)
-        ok = QPushButton("잠금 해제")
-        ok.clicked.connect(d.accept)
-        e.returnPressed.connect(d.accept)
-        v.addWidget(ok)
-        if d.exec() != QDialog.Accepted:
-            return None
-        if tabs.currentIndex() == 0:
-            if len(pad.seq) < 4:
-                QMessageBox.information(self, APP_NAME, "패턴은 점 4개 이상이어야 해요.")
-                return None
-            secret = ("P", pad.seq)
-        else:
-            if not e.text():
-                return None
-            secret = ("N", e.text())
-        self.cfg["unlock_kind"] = secret[0]
-        if remember.isChecked():
-            try:
-                import base64
-                blob = dpapi(f"{secret[0]}:{secret[1]}".encode(), True)
-                self._set("pin_saved", base64.b64encode(blob).decode())
-            except Exception:
-                pass
-        return secret
-
-    def ask_unlock(self):
-        serial = self.current_serial()
-        if not serial:
-            return
-        secret = None
-        if self.cfg.get("pin_saved") and IS_WIN:
-            try:
-                import base64
-                raw = dpapi(base64.b64decode(self.cfg["pin_saved"]), False).decode()
-                kind, val = raw.split(":", 1) if ":" in raw else ("N", raw)
-                secret = (kind, val)
-            except Exception:
-                secret = None
-        if not secret:
-            secret = self._unlock_dialog()
-            if not secret:
-                return
-        kind, val = secret
-        if kind == "N" and not re.fullmatch(r"[0-9A-Za-z]+", val):
-            QMessageBox.warning(self, APP_NAME, "영문/숫자만 자동 입력할 수 있어요. 폰 화면 창을 클릭하고 키보드로 직접 입력해 주세요.")
-            return
-        self.statusBar().showMessage("잠금 해제 중…")
-
-        def work():
-            try:
-                was_awake = self.phone.is_awake(serial)
-                if not was_awake:
-                    self.phone.key(serial, 224)  # WAKEUP
-                    time.sleep(0.8)
-                if kind == "P":
-                    self.phone.unlock_pattern(serial, val)
-                else:
-                    self.phone.unlock(serial, val)
-                time.sleep(1.5)
-                if self.phone.is_locked(serial):
-                    self.bus.status.emit("잠금 해제가 안 됐어요. 패턴/PIN을 확인해 주세요.")
-                    if self.cfg.get("pin_saved"):
-                        self.bus.call.emit(lambda: self._set("pin_saved", ""))
-                    return
-                self.bus.status.emit("🔓 잠금 해제됐어요.")
-                self.bus.call.emit(lambda: self.lock_bar.hide())
-                if not was_awake and self.cfg.get("turn_screen_off"):
-                    self.bus.call.emit(self._reopen_main)
-            except Exception as ex:
-                self.bus.status.emit(f"잠금 해제 실패: {ex}")
+                self._watch_busy = False
         bg(work)
 
     def _tick(self):
-        self._check_lock()
+        self._keep_awake_watch()
         self._maybe_reconnect()
         self.refresh_devices()
         self._render_sessions()
