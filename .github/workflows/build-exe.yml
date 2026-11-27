@@ -1,18 +1,70 @@
 name: Build Windows exe
 on:
   push:
+    branches: [main]
   workflow_dispatch:
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Download latest scrcpy (win64)
+        shell: pwsh
+        run: |
+          $rel = gh api repos/Genymobile/scrcpy/releases/latest | ConvertFrom-Json
+          $asset = $rel.assets | Where-Object { $_.name -match '^scrcpy-win64-v[\d.]+\.zip$' } | Select-Object -First 1
+          if (-not $asset) { throw "scrcpy win64 asset not found" }
+          Write-Host "scrcpy $($rel.tag_name): $($asset.name)"
+          Invoke-WebRequest $asset.browser_download_url -OutFile scrcpy.zip
+          Expand-Archive scrcpy.zip -DestinationPath scrcpy_tmp
+          $dir = Get-ChildItem scrcpy_tmp -Directory | Select-Object -First 1
+          Move-Item $dir.FullName scrcpy
+          Invoke-WebRequest https://raw.githubusercontent.com/Genymobile/scrcpy/master/LICENSE -OutFile scrcpy/LICENSE-scrcpy.txt
+          "SCRCPY_VERSION=$($rel.tag_name)" >> $env:GITHUB_ENV
+          Get-ChildItem scrcpy
+
       - run: pip install -r requirements.txt pyinstaller
-      - run: pyinstaller --noconfirm --onefile --windowed --name PhoneLauncher phone_launcher.py
+
+      - name: Build single exe (launcher + scrcpy + adb)
+        run: pyinstaller --noconfirm --onefile --windowed --name PhoneLauncher --add-data "scrcpy;scrcpy" phone_launcher.py
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory release | Out-Null
+          Copy-Item dist/PhoneLauncher.exe release/
+          Copy-Item scrcpy/LICENSE-scrcpy.txt release/
+          @"
+          PhoneLauncher.exe includes scrcpy $env:SCRCPY_VERSION (https://github.com/Genymobile/scrcpy),
+          licensed under the Apache License 2.0 (see LICENSE-scrcpy.txt),
+          and Android platform-tools (adb) as shipped in the scrcpy release.
+          "@ | Out-File release/THIRD-PARTY-NOTICES.txt -Encoding utf8
+          Compress-Archive release/* PhoneLauncher-win64.zip
+
       - uses: actions/upload-artifact@v4
         with:
-          name: PhoneLauncher
-          path: dist/PhoneLauncher.exe
+          name: PhoneLauncher-win64
+          path: release/
+
+      - name: Publish to "latest" release
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: PhoneLauncher (latest build, scrcpy ${{ env.SCRCPY_VERSION }})
+          body: |
+            PhoneLauncher.exe 하나만 받아서 실행하면 돼요 (scrcpy ${{ env.SCRCPY_VERSION }} + adb 내장, 파이썬 불필요).
+            자동 빌드: ${{ github.sha }}
+          prerelease: false
+          make_latest: true
+          files: |
+            release/PhoneLauncher.exe
+            PhoneLauncher-win64.zip

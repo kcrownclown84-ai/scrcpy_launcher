@@ -36,7 +36,11 @@ scrcpy-launcher\
 2. `run.bat` 더블클릭
 3. 위쪽에 폰 이름이 뜨면 앱 아이콘 클릭 → 실행!
 
-### exe로 만들기
+### 가장 쉬운 방법: 완성된 exe 받기
+[Releases](https://github.com/kcrownclown84-ai/scrcpy_launcher/releases/latest)에서 `PhoneLauncher.exe` 하나만 받아 실행하세요. scrcpy와 adb가 들어 있어서 따로 설치할 게 없어요 (폰 USB 디버깅만 켜면 됨).
+같은 폴더에 `scrcpy` 폴더를 두면 내장 버전 대신 그걸 써요 (scrcpy만 최신으로 바꾸고 싶을 때).
+
+### exe로 직접 만들기
 - **내 PC에서**: `build_exe.bat` 더블클릭 → `dist\PhoneLauncher.exe` 생성 (setup.bat 없이 바로 돼요. 파이썬 3.8도 OK). exe 옆에 `scrcpy` 폴더를 두면 끝. 이후엔 파이썬 없이 exe만으로 실행돼요.
 - **GitHub에서 자동으로**: 이 폴더를 GitHub 저장소에 올리면 `.github/workflows/build-exe.yml` 이 Windows에서 exe를 만들어 Actions 탭의 *Artifacts* 에 올려줘요.
 

@@ -803,6 +803,13 @@ class MainWindow(QMainWindow):
         for s in self.sessions:
             if s.proc.poll() is None:
                 s.proc.terminate()
+        # exe에 내장된 adb는 임시 폴더에서 돌기 때문에, 종료할 때 같이 꺼줘야 임시 파일이 정리됨
+        adb = self.phone.adb
+        if adb and getattr(sys, "frozen", False) and str(APP_DIR) in adb:
+            try:
+                run([adb, "kill-server"], timeout=5)
+            except Exception:
+                pass
         super().closeEvent(e)
 
 
