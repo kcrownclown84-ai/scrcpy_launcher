@@ -37,6 +37,8 @@ EXE_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path
 # 설정 파일은 exe 옆이 아니라 %APPDATA%\\PhoneLauncher 에 저장 (설정을 바꿀 때만 생성됨)
 CONFIG_DIR = Path(os.environ.get("APPDATA") or (Path.home() / ".config")) / "PhoneLauncher"
 CONFIG_PATH = CONFIG_DIR / "config.json"
+ICON_DIR = CONFIG_DIR / "icons"   # 폰에서 가져온 앱 아이콘 캐시
+ICON_HELPER = APP_DIR / "assets" / "iconhelper.jar"  # 폰에서 아이콘을 꺼내는 도우미 (CI에서 빌드)
 LEGACY_CONFIG = EXE_DIR / "phone_launcher_config.json"
 NO_SAVE = "--no-save" in sys.argv  # 바로가기에 --no-save 를 붙이면 아무 파일도 안 남김
 SHOT_DIR = Path.home() / "Pictures" / "PhoneLauncher"
@@ -334,6 +336,38 @@ class Phone:
     # --- 앱 목록 ---------------------------------------------------------------
     LIST_RE = re.compile(r"^\s*([*-])\s+(.+?)\s{2,}([\w.]+)\s*$")
 
+    # --- 앱 아이콘 (폰에서 직접 가져오기) ---------------------------------------
+    REMOTE_HELPER = "/data/local/tmp/pl_icons.jar"
+
+    def fetch_icons(self, serial: str, pkgs: list[str], size: int = 96, chunk: int = 25):
+        """폰에서 아이콘 PNG를 꺼내 (pkg, bytes) 묶음을 chunk 단위로 yield."""
+        if not (self.adb and ICON_HELPER.is_file() and pkgs):
+            return
+        import base64
+        self.ensure_server()
+        r = run([self.adb, "-s", serial, "push", str(ICON_HELPER), self.REMOTE_HELPER], timeout=30)
+        if r.returncode != 0:
+            return
+        try:
+            for i in range(0, len(pkgs), chunk):
+                part = pkgs[i:i + chunk]
+                r = run([self.adb, "-s", serial, "shell", f"CLASSPATH={self.REMOTE_HELPER}",
+                         "app_process", "/", "IconDump", str(size), *part], timeout=90)
+                got = {}
+                for line in r.stdout.decode("utf-8", "replace").splitlines():
+                    bits = line.strip().split(" ", 1)
+                    if len(bits) == 2 and bits[1] != "-" and bits[0] in part:
+                        try:
+                            got[bits[0]] = base64.b64decode(bits[1])
+                        except Exception:
+                            pass
+                yield got
+        finally:
+            try:
+                self.shell(serial, "rm", "-f", self.REMOTE_HELPER)
+            except Exception:
+                pass
+
     def list_apps(self, serial: str) -> list[AppInfo]:
         apps: list[AppInfo] = []
         # 1) scrcpy --list-apps : 앱 이름까지 나옴 (scrcpy 2.1+)
@@ -416,6 +450,7 @@ def letter_icon(text: str, key: str, size: int = 64) -> QIcon:
 class Bus(QObject):
     devices = Signal(list)
     apps = Signal(str, list)
+    icons = Signal(dict)
     status = Signal(str)
     error = Signal(str)
 
@@ -643,6 +678,7 @@ class MainWindow(QMainWindow):
         self.devices: list[Device] = []
         self.apps: list[AppInfo] = []
         self.sessions: list[Session] = []
+        self.icons: dict = {}
 
         self.setWindowTitle(APP_NAME)
         self.resize(560, 760)
@@ -871,6 +907,7 @@ class MainWindow(QMainWindow):
     def _wire(self):
         self.bus.devices.connect(self._on_devices)
         self.bus.apps.connect(self._on_apps)
+        self.bus.icons.connect(self._on_icons)
         self.bus.status.connect(lambda m: self.statusBar().showMessage(m, 6000))
         self.bus.error.connect(lambda m: QMessageBox.warning(self, APP_NAME, m))
         self.search.textChanged.connect(self._render_apps)
@@ -994,6 +1031,60 @@ class MainWindow(QMainWindow):
         self.apps = apps
         self._render_apps()
         self.statusBar().showMessage(f"앱 {len(apps)}개", 4000)
+        self.load_icons(serial, apps)
+
+    # ---------------- 앱 아이콘 ----------------
+    def load_icons(self, serial: str, apps: list):
+        """캐시 → 없으면 폰에서 가져오기. 백그라운드에서 돌고, 받는 대로 화면에 반영."""
+        if getattr(self, "_icon_job", None) == serial:
+            return
+        self._icon_job = serial
+
+        def work():
+            try:
+                missing, cached = [], {}
+                # 사용자 앱 먼저, 시스템 앱은 나중에
+                for a in sorted(apps, key=lambda a: a.system):
+                    if a.package in self.icons:
+                        continue
+                    f = ICON_DIR / f"{a.package}.png"
+                    if not NO_SAVE and f.is_file():
+                        cached[a.package] = f.read_bytes()
+                    else:
+                        missing.append(a.package)
+                if cached:
+                    self.bus.icons.emit(cached)
+                if missing and ICON_HELPER.is_file():
+                    self.bus.status.emit(f"폰에서 앱 아이콘 가져오는 중… ({len(missing)}개)")
+                    for got in self.phone.fetch_icons(serial, missing):
+                        if not got:
+                            continue
+                        if not NO_SAVE:
+                            try:
+                                ICON_DIR.mkdir(parents=True, exist_ok=True)
+                                for pkg, data in got.items():
+                                    (ICON_DIR / f"{pkg}.png").write_bytes(data)
+                            except Exception:
+                                pass
+                        self.bus.icons.emit(got)
+                    self.bus.status.emit("앱 아이콘을 다 가져왔어요.")
+            except Exception as e:
+                self.bus.status.emit(f"아이콘 가져오기 실패: {e}")
+            finally:
+                self._icon_job = None
+        bg(work)
+
+    def _on_icons(self, got: dict):
+        for pkg, data in got.items():
+            pm = QPixmap()
+            if pm.loadFromData(data):
+                self.icons[pkg] = QIcon(pm)
+        for lst in (self.app_list, self.fav_list):
+            for i in range(lst.count()):
+                it = lst.item(i)
+                ic = self.icons.get(it.data(Qt.UserRole))
+                if ic:
+                    it.setIcon(ic)
 
     def _render_apps(self):
         q = self.search.text().strip().lower()
@@ -1014,7 +1105,7 @@ class MainWindow(QMainWindow):
             self.app_list.addItem(self._item(a))
 
     def _item(self, a: AppInfo) -> QListWidgetItem:
-        it = QListWidgetItem(letter_icon(a.name, a.package), a.name)
+        it = QListWidgetItem(self.icons.get(a.package) or letter_icon(a.name, a.package), a.name)
         it.setData(Qt.UserRole, a.package)
         it.setToolTip(f"{a.name}\n{a.package}")
         it.setTextAlignment(Qt.AlignHCenter | Qt.AlignTop)
