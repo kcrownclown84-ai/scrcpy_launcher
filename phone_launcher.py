@@ -57,6 +57,7 @@ DEFAULT_CONFIG = {
     "separate_windows": False,  # 앱마다 새 창(가상 디스플레이)
     "virtual_size": "1080x1920/420",
     "show_system_apps": False,
+    "theme": "dark",            # dark | light | system
     "favorites": [],
 }
 
@@ -288,30 +289,63 @@ def bg(fn, *args):
 # ----------------------------------------------------------------------------
 # 메인 창
 # ----------------------------------------------------------------------------
-STYLE = """
-QWidget { background:#1E1F24; color:#E6E6E6; font-size:13px; }
-QLineEdit, QComboBox, QSpinBox { background:#2A2C33; border:1px solid #3A3D46;
+THEMES = {
+    "dark": dict(bg="#1E1F24", fg="#E6E6E6", field="#2A2C33", border="#3A3D46", panel="#24262C",
+                 hover="#2F323B", sel="#33405E", flat="#2A2C33", flathover="#353843",
+                 side="#17181C", tool="#2A2C33", toolhover="#3A3E4A", muted="#9AA0AA",
+                 check="#5A5F6B", accent="#2F6FED", accenthover="#4A82F0"),
+    "light": dict(bg="#F4F5F7", fg="#1F2329", field="#FFFFFF", border="#D3D7DE", panel="#FFFFFF",
+                  hover="#EEF1F6", sel="#DCE7FF", flat="#E6E9EF", flathover="#DADFE7",
+                  side="#E9ECF1", tool="#FFFFFF", toolhover="#DCE3EE", muted="#6B7280",
+                  check="#9AA3B2", accent="#2F6FED", accenthover="#4A82F0"),
+}
+
+STYLE_TMPL = """
+QWidget { background:$bg; color:$fg; font-size:13px; }
+QLineEdit, QComboBox, QSpinBox { background:$field; border:1px solid $border;
     border-radius:6px; padding:5px 8px; }
-QPushButton { background:#2F6FED; border:none; border-radius:6px; padding:7px 12px; color:white; }
-QPushButton:hover { background:#4A82F0; }
-QPushButton#flat { background:#2A2C33; }
-QPushButton#flat:hover { background:#353843; }
-QListWidget { background:#24262C; border:none; border-radius:10px; padding:8px; }
-QListWidget::item { border-radius:10px; padding:6px; }
-QListWidget::item:hover { background:#2F323B; }
-QListWidget::item:selected { background:#33405E; }
+QPushButton { background:$accent; border:none; border-radius:6px; padding:7px 12px; color:white; }
+QPushButton:hover { background:$accenthover; }
+QPushButton#flat { background:$flat; color:$fg; }
+QPushButton#flat:hover { background:$flathover; }
+QListWidget { background:$panel; border:none; border-radius:10px; padding:8px; }
+QListWidget::item { border-radius:10px; padding:6px; color:$fg; }
+QListWidget::item:hover { background:$hover; }
+QListWidget::item:selected { background:$sel; color:$fg; }
 QTabWidget::pane { border:none; }
-QTabBar::tab { background:#24262C; padding:7px 16px; border-top-left-radius:6px;
+QTabBar::tab { background:$panel; padding:7px 16px; border-top-left-radius:6px;
     border-top-right-radius:6px; margin-right:2px; }
-QTabBar::tab:selected { background:#2F6FED; }
-QToolButton { background:#2A2C33; border:none; border-radius:10px; font-size:20px; }
-QToolButton:hover { background:#3A3E4A; }
-QToolButton:pressed { background:#2F6FED; }
-QFrame#sidebar { background:#17181C; border-left:1px solid #2A2C33; }
-QStatusBar { background:#17181C; color:#9AA0AA; }
-QCheckBox::indicator { width:16px; height:16px; border:1px solid #5A5F6B; border-radius:4px; background:#2A2C33; }
-QCheckBox::indicator:checked { background:#2F6FED; border-color:#2F6FED; }
+QTabBar::tab:selected { background:$accent; color:white; }
+QToolButton { background:$tool; border:none; border-radius:10px; font-size:20px; color:$fg; }
+QToolButton:hover { background:$toolhover; }
+QToolButton:pressed { background:$accent; }
+QFrame#sidebar { background:$side; border-left:1px solid $border; }
+QFrame#sidebar QFrame#sep { background:$border; }
+QFrame#sidebar QWidget { background:transparent; }
+QFrame#sidebar QToolButton { background:$tool; }
+QFrame#sidebar QToolButton:hover { background:$toolhover; }
+QFrame#sidebar QToolButton:pressed { background:$accent; }
+QLabel#muted { color:$muted; }
+QStatusBar { background:$side; color:$muted; }
+QMenu { background:$field; border:1px solid $border; }
+QMenu::item:selected { background:$sel; }
+QCheckBox::indicator { width:16px; height:16px; border:1px solid $check; border-radius:4px; background:$field; }
+QCheckBox::indicator:checked { background:$accent; border-color:$accent; }
 """
+
+
+def system_is_dark() -> bool:
+    try:
+        return QApplication.styleHints().colorScheme() == Qt.ColorScheme.Dark
+    except Exception:
+        return False
+
+
+def build_style(theme: str) -> str:
+    if theme not in THEMES:
+        theme = "dark" if system_is_dark() else "light"
+    from string import Template
+    return Template(STYLE_TMPL).substitute(THEMES[theme])
 
 
 class MainWindow(QMainWindow):
@@ -328,6 +362,11 @@ class MainWindow(QMainWindow):
         self.resize(560, 760)
         self._build_ui()
         self._wire()
+        try:  # Windows 다크/라이트 설정이 바뀌면 바로 반영 (테마 = system 일 때)
+            QApplication.styleHints().colorSchemeChanged.connect(
+                lambda *_: self.cfg.get("theme") == "system" and self.apply_theme())
+        except Exception:
+            pass
         self._locate_tools()
 
         self.poll = QTimer(self, interval=3000, timeout=self._tick)
@@ -409,7 +448,7 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(root)
         self.setStatusBar(QStatusBar())
-        self.setStyleSheet(STYLE)
+        self.apply_theme()
 
     def _grid(self, height: int | None = None) -> QListWidget:
         w = QListWidget()
@@ -454,7 +493,7 @@ class MainWindow(QMainWindow):
             if b is None:
                 line = QFrame()
                 line.setFixedHeight(1)
-                line.setStyleSheet("background:#2A2C33;")
+                line.setObjectName("sep")
                 v.addWidget(line)
                 continue
             icon, tip, fn = b
@@ -471,6 +510,14 @@ class MainWindow(QMainWindow):
         f.setContentsMargins(4, 12, 4, 4)
         f.setVerticalSpacing(10)
         c = self.cfg
+
+        self.s_theme = QComboBox()
+        for key, label in (("dark", "다크"), ("light", "라이트"), ("system", "Windows 설정 따라가기")):
+            self.s_theme.addItem(label, key)
+        self.s_theme.setCurrentIndex(max(0, self.s_theme.findData(c.get("theme", "dark"))))
+        self.s_theme.currentIndexChanged.connect(
+            lambda _: (self._set("theme", self.s_theme.currentData()), self.apply_theme()))
+        f.addRow("화면 테마", self.s_theme)
 
         self.s_path = QLineEdit(c["scrcpy_path"], placeholderText="자동으로 찾음")
         pb = QPushButton("찾아보기")
@@ -513,7 +560,7 @@ class MainWindow(QMainWindow):
             "Alt+F 전체화면 · Alt+R 회전 · Alt+B 뒤로 · Alt+H 홈 · 우클릭 = 뒤로"
         )
         tips.setWordWrap(True)
-        tips.setStyleSheet("color:#9AA0AA;")
+        tips.setObjectName("muted")
         f.addRow(tips)
         return w
 
@@ -529,6 +576,9 @@ class MainWindow(QMainWindow):
         for lst in (self.app_list, self.fav_list):
             lst.itemClicked.connect(self._on_app_clicked)
             lst.customContextMenuRequested.connect(lambda pos, l=lst: self._app_menu(l, pos))
+
+    def apply_theme(self):
+        self.setStyleSheet(build_style(self.cfg.get("theme", "dark")))
 
     def _set(self, key, value):
         self.cfg[key] = value
