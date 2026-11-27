@@ -32,6 +32,10 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "폰 런처"
+try:  # CI가 빌드할 때 만들어 넣는 파일 (빌드 날짜·커밋)
+    from _build_info import BUILD  # type: ignore
+except Exception:
+    BUILD = "개발 버전"
 APP_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 EXE_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 # 설정 파일은 exe 옆이 아니라 %APPDATA%\\PhoneLauncher 에 저장 (설정을 바꿀 때만 생성됨)
@@ -60,7 +64,7 @@ DEFAULT_CONFIG = {
     "bitrate_mbps": 8,
     "always_on_top": False,
     "dock_window": True,        # scrcpy 창을 런처 옆에 붙이기
-    "separate_windows": False,  # 앱마다 새 창(가상 디스플레이)
+    "separate_windows": True,   # 앱 목록에서 실행하면 새 창(가상 디스플레이)으로
     "virtual_size": "1080x1920/420",
     "aspect": "phone",          # 폰 화면 창 비율: phone(그대로 미러링) | 16:9 | 16:10 | 4:3 | 21:9 | custom
     "aspect_landscape": True,   # 가로 방향
@@ -70,6 +74,8 @@ DEFAULT_CONFIG = {
     "favorites": [],
     "wifi_addr": "",            # 마지막으로 무선 연결한 IP:포트
     "wifi_auto": True,          # 시작할 때 무선 자동 재연결
+    "embed_mirror": True,       # 폰 화면을 런처 안에 넣기 (Windows)
+    "auto_mirror": True,        # 폰이 연결되면 폰 화면 자동으로 열기
     "power_save": False,        # 절전 모드: 해상도·FPS·화질을 낮춰 폰 발열/배터리 절약
 }
 
@@ -169,6 +175,7 @@ class AppInfo:
     package: str
     name: str
     system: bool = False
+    launchable: bool = True
 
 
 @dataclass
@@ -179,6 +186,7 @@ class Session:
     kind: str  # "main" | "app"
     started: float = field(default_factory=time.time)
     display_id: int | None = None  # 가상 디스플레이 번호 (비율 모드)
+    embedded: bool = False
 
 
 class Phone:
@@ -373,6 +381,7 @@ class Phone:
         self.ensure_server()
         r = run([self.adb, "-s", serial, "push", str(ICON_HELPER), self.REMOTE_HELPER], timeout=30)
         if r.returncode != 0:
+            self.icon_error = "push 실패: " + (r.stdout + r.stderr).decode("utf-8", "replace").strip()[:300]
             return
         try:
             for i in range(0, len(pkgs), chunk):
@@ -387,6 +396,8 @@ class Phone:
                             got[bits[0]] = base64.b64decode(bits[1])
                         except Exception:
                             pass
+                if not got:
+                    self.icon_error = (r.stdout + r.stderr).decode("utf-8", "replace").strip()[:300]
                 yield got
         finally:
             try:
@@ -436,6 +447,20 @@ class Phone:
             for pkg in launchable:
                 nice = pkg.split(".")[-1].capitalize()
                 apps.append(AppInfo(pkg, nice, pkg not in user))
+        # 실행 가능한 앱(홈 화면에 아이콘이 있는 앱)만 기본으로 보여주기 (삼성 기본 앱 포함)
+        try:
+            out = self.shell(serial, "cmd", "package", "query-activities", "--brief",
+                             "-a", "android.intent.action.MAIN", "-c", "android.intent.category.LAUNCHER",
+                             timeout=20)
+            launch = {l.strip().split("/")[0] for l in out.splitlines() if "/" in l}
+            if launch:
+                known = {a.package for a in apps}
+                for a in apps:
+                    a.launchable = a.package in launch
+                for pkg in launch - known:  # 목록에 없던 앱 추가
+                    apps.append(AppInfo(pkg, pkg.split(".")[-1].capitalize(), False, True))
+        except Exception:
+            pass
         apps.sort(key=lambda a: a.name.lower())
         return apps
 
@@ -786,8 +811,8 @@ class MainWindow(QMainWindow):
         self.sessions: list[Session] = []
         self.icons: dict = {}
 
-        self.setWindowTitle(APP_NAME)
-        self.resize(560, 760)
+        self.setWindowTitle(f"{APP_NAME}  ·  {BUILD}")
+        self.resize(980, 860)
         self._build_ui()
         self._wire()
         try:  # Windows 다크/라이트 설정이 바뀌면 바로 반영 (테마 = system 일 때)
@@ -847,13 +872,25 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         v.addWidget(self.tabs, 1)
 
+        # 탭0: 폰 화면 (실제 폰 화면을 그대로 미러링)
+        self.phone_tab = QWidget()
+        self.phone_lay = QVBoxLayout(self.phone_tab)
+        self.phone_lay.setContentsMargins(0, 8, 0, 0)
+        self.phone_hint = QLabel("폰을 연결하면 여기에 폰 화면이 나와요.\n\n"
+                                 "'앱' 탭에서 앱을 누르면 그 앱은 PC에 새 창으로 따로 열려요.")
+        self.phone_hint.setAlignment(Qt.AlignCenter)
+        self.phone_hint.setObjectName("muted")
+        self.phone_lay.addWidget(self.phone_hint, 1)
+        self.embed_box = None
+        self.tabs.addTab(self.phone_tab, "폰 화면")
+
         # 탭1: 앱
         apps_tab = QWidget()
         av = QVBoxLayout(apps_tab)
         av.setContentsMargins(0, 8, 0, 0)
         srow = QHBoxLayout()
         self.search = QLineEdit(placeholderText="🔍  앱 검색 (이름 또는 패키지)")
-        self.chk_system = QCheckBox("시스템 앱")
+        self.chk_system = QCheckBox("숨은 앱까지")
         self.chk_system.setChecked(self.cfg["show_system_apps"])
         btn_reload = QPushButton("앱 새로고침")
         btn_reload.setObjectName("flat")
@@ -980,10 +1017,12 @@ class MainWindow(QMainWindow):
         f.addRow(chk("turn_screen_off", "폰 화면 끄고 사용 (PC에만 표시)"))
         f.addRow(chk("stay_awake", "연결 중에는 폰이 잠들지 않게"))
         f.addRow(chk("audio", "폰 소리를 PC 스피커로 (Android 11+)"))
-        f.addRow(chk("dock_window", "폰 화면 창을 런처 옆에 붙이기"))
+        f.addRow(chk("auto_mirror", "폰이 연결되면 폰 화면 자동으로 열기"))
+        f.addRow(chk("embed_mirror", "폰 화면을 런처 안('폰 화면' 탭)에 넣기 (끄면 별도 창)"))
+        f.addRow(chk("dock_window", "별도 창일 때 런처 옆에 붙이기"))
         f.addRow(chk("always_on_top", "폰 화면 창 항상 위"))
         f.addRow(chk("power_save", "절전 모드 (1024px · 30fps · 4Mbps로 낮춰 폰 발열·배터리 절약)"))
-        f.addRow(chk("separate_windows", "앱마다 새 창으로 열기 (가상 디스플레이, Android 10+)"))
+        f.addRow(chk("separate_windows", "앱 탭에서 실행한 앱은 새 창으로 열기 (가상 디스플레이, Android 10+)"))
 
         def spin(key, lo, hi, step, suffix):
             sb = QSpinBox(minimum=lo, maximum=hi, singleStep=step, suffix=suffix)
@@ -1196,6 +1235,12 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("폰에서 'USB 디버깅 허용' 팝업을 눌러주세요.")
         self._update_mirror_btn()
         self.refresh_apps()
+        self.refresh_battery()
+        serial = self.current_serial()
+        if serial and self.cfg.get("auto_mirror", True) and self.phone.scrcpy \
+                and not self._main_session(serial) and serial not in getattr(self, "_auto_opened", set()):
+            self._auto_opened = getattr(self, "_auto_opened", set()) | {serial}
+            QTimer.singleShot(500, lambda: self.current_serial() == serial and self.open_main(serial))
 
     # ---------------- 앱 목록 ----------------
     def refresh_apps(self):
@@ -1240,9 +1285,14 @@ class MainWindow(QMainWindow):
                         missing.append(a.package)
                 if cached:
                     self.bus.icons.emit(cached)
+                if missing and not ICON_HELPER.is_file():
+                    self.bus.status.emit("이 버전에는 아이콘 도우미가 없어요 (GitHub 릴리스의 exe를 쓰세요)")
                 if missing and ICON_HELPER.is_file():
                     self.bus.status.emit(f"폰에서 앱 아이콘 가져오는 중… ({len(missing)}개)")
+                    total = 0
+                    self.phone.icon_error = ""
                     for got in self.phone.fetch_icons(serial, missing):
+                        total += len(got)
                         if not got:
                             continue
                         if not NO_SAVE:
@@ -1253,7 +1303,11 @@ class MainWindow(QMainWindow):
                             except Exception:
                                 pass
                         self.bus.icons.emit(got)
-                    self.bus.status.emit("앱 아이콘을 다 가져왔어요.")
+                    if total:
+                        self.bus.status.emit(f"앱 아이콘 {total}개를 가져왔어요.")
+                    else:
+                        self.bus.status.emit("앱 아이콘을 못 가져왔어요. 설정 → '앱 아이콘 다시 받기 + 진단'을 눌러주세요. "
+                                             + getattr(self.phone, "icon_error", "")[:120])
             except Exception as e:
                 self.bus.status.emit(f"아이콘 가져오기 실패: {e}")
             finally:
@@ -1316,7 +1370,7 @@ class MainWindow(QMainWindow):
             if a:
                 self.fav_list.addItem(self._item(a))
         for a in self.apps:
-            if a.system and not show_sys:
+            if not a.launchable and not show_sys:
                 continue
             if q and q not in a.name.lower() and q not in a.package.lower():
                 continue
@@ -1360,7 +1414,7 @@ class MainWindow(QMainWindow):
     def _require(self) -> str | None:
         if not self.phone.scrcpy:
             QMessageBox.warning(self, APP_NAME, "scrcpy를 찾지 못했어요.\n설정 탭에서 scrcpy.exe 위치를 지정해주세요.")
-            self.tabs.setCurrentIndex(2)
+            self.tabs.setCurrentIndex(3)
             return None
         s = self.current_serial()
         if not s:
@@ -1421,12 +1475,60 @@ class MainWindow(QMainWindow):
             args.append(f"--new-display={vd}")
         elif self.cfg["turn_screen_off"]:
             args.append("--turn-screen-off")
-        args += self._dock_args()
+        embed = IS_WIN and self.cfg.get("embed_mirror", True)
+        if embed:
+            args.append("--window-borderless")
+        else:
+            args += self._dock_args()
         title = f"{APP_NAME} - {self._device_name(serial)}"
         args.append(f"--window-title={title}")
         if start_app:
             args.append(f"--start-app={start_app}")
-        return self._spawn(args, serial, title, "main")
+        s = self._spawn(args, serial, title, "main")
+        if embed:
+            bg(self._embed_when_ready, s)
+        return s
+
+    # ---------------- 폰 화면을 런처 안에 넣기 (Windows) ----------------
+    def _embed_when_ready(self, s: Session):
+        import ctypes
+        user32 = ctypes.windll.user32
+        hwnd = 0
+        for _ in range(150):  # 최대 15초 동안 scrcpy 창이 뜨길 기다림
+            if s.proc.poll() is not None:
+                return
+            hwnd = user32.FindWindowW(None, s.title)
+            if hwnd:
+                break
+            time.sleep(0.1)
+        if hwnd:
+            time.sleep(0.3)
+            self.bus.call.emit(lambda: self._embed(s, hwnd))
+
+    def _embed(self, s: Session, hwnd: int):
+        from PySide6.QtGui import QWindow
+        try:
+            self._unembed()
+            win = QWindow.fromWinId(hwnd)
+            box = QWidget.createWindowContainer(win, self.phone_tab)
+            box.setFocusPolicy(Qt.StrongFocus)
+            self.phone_hint.hide()
+            self.phone_lay.addWidget(box, 1)
+            self.embed_box = box
+            s.embedded = True
+            self.tabs.setCurrentIndex(0)
+            box.setFocus()
+        except Exception as e:  # 실패하면 별도 창으로 그대로 둠
+            self.statusBar().showMessage(f"폰 화면을 안에 넣지 못해 별도 창으로 띄웠어요: {e}", 8000)
+
+    def _unembed(self):
+        if self.embed_box is not None:
+            self.phone_lay.removeWidget(self.embed_box)
+            self.embed_box.hide()
+            self.embed_box.setParent(None)
+            self.embed_box.deleteLater()
+            self.embed_box = None
+        self.phone_hint.show()
 
     def launch(self, pkg: str, name: str, separate: bool | None = None, restart: bool = False):
         serial = self._require()
@@ -1488,6 +1590,9 @@ class MainWindow(QMainWindow):
             self.bus.error.emit(f"'{s.title}' 창을 열지 못했어요.\n\n{tail}")
 
     def _render_sessions(self):
+        if self.embed_box is not None and not any(
+                s.embedded and s.proc.poll() is None for s in self.sessions):
+            self._unembed()
         self.sessions = [s for s in self.sessions if s.proc.poll() is None]
         self.run_list.clear()
         for s in self.sessions:
@@ -1495,7 +1600,7 @@ class MainWindow(QMainWindow):
             it = QListWidgetItem(f"{'🖥' if s.kind == 'main' else '🪟'}  {s.title}   ·  {kind}  ·  {s.serial}")
             it.setData(Qt.UserRole, id(s))
             self.run_list.addItem(it)
-        self.tabs.setTabText(1, f"실행 중 ({len(self.sessions)})" if self.sessions else "실행 중")
+        self.tabs.setTabText(2, f"실행 중 ({len(self.sessions)})" if self.sessions else "실행 중")
 
     def stop_selected(self):
         for it in self.run_list.selectedItems():

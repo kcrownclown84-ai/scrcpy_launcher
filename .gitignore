@@ -6,3 +6,4 @@ __pycache__/
 scrcpy/
 phone_launcher_config.json
 out/
+_build_info.py
