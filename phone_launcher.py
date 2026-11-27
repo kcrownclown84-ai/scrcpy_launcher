@@ -237,13 +237,34 @@ class Phone:
                    "• 폰의 페어링 창이 닫히면 포트가 사라져요. 창을 띄운 채로, 새 IP:포트와 코드로 다시 하세요.\n"
                    "• 공유기의 게스트 Wi-Fi나 'AP 격리/무선 격리'가 켜져 있으면 유선 PC와 통신이 막혀요.")
 
+    @staticmethod
+    def network_hint(addr: str) -> str:
+        """PC와 폰이 다른 네트워크(대역)에 있으면 그 사실을 알려주는 문구."""
+        import socket
+        try:
+            host = addr.rsplit(":", 1)[0]
+            u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            u.connect((host, 9))  # 패킷은 안 보냄. PC가 그 주소로 갈 때 쓰는 내 IP만 확인
+            mine = u.getsockname()[0]
+            u.close()
+        except Exception:
+            return ""
+        if mine.split(".")[:3] != host.split(".")[:3]:
+            return (f"⚠ PC의 IP는 {mine}, 폰은 {host} 예요. 서로 다른 네트워크라서 연결할 수 없어요.\n"
+                    "PC가 연결된 공유기의 Wi-Fi에 폰을 연결하거나, PC를 폰과 같은 Wi-Fi에 연결하세요.\n"
+                    "(회사망·게스트 Wi-Fi처럼 기기끼리 막힌 네트워크에서는 무선 연결이 안 돼요.)")
+        return ""
+
+    def unreachable_msg(self, addr: str) -> str:
+        return self.network_hint(addr) or self.UNREACHABLE
+
     def pair(self, addr: str, code: str) -> tuple[bool, str]:
         # 페어링 포트에 미리 접속해보면 폰이 창을 닫을 수 있어서, 확인은 실패한 뒤에만 함
         try:
             out = self.adb_out("pair", addr, code, timeout=40)
         except subprocess.TimeoutExpired:
             if not self.reachable(addr):
-                return False, self.UNREACHABLE
+                return False, self.unreachable_msg(addr)
             return False, ("응답이 없어요 (시간 초과).\n"
                            "• 폰에서 페어링 창을 닫았다가 새 코드로 다시 해보세요.\n"
                            "• 그래도 안 되면 런처를 껐다 켠 뒤 다시 시도하세요.")
@@ -252,12 +273,13 @@ class Phone:
         if "Wrong password" in out or "protocol fault" in out:
             return False, "코드가 틀렸거나 만료됐어요. 폰에서 새 코드를 띄워 다시 입력하세요."
         if not self.reachable(addr):
-            return False, self.UNREACHABLE
+            return False, self.unreachable_msg(addr)
         return False, out
 
     def connect(self, addr: str) -> tuple[bool, str]:
         if not self.reachable(addr):
-            return False, ("PC에서 폰의 그 주소로 접속이 안 돼요. 무선 디버깅 화면 맨 위의 "
+            return False, (self.network_hint(addr) or
+                           "PC에서 폰의 그 주소로 접속이 안 돼요. 무선 디버깅 화면 맨 위의 "
                            "'IP 주소 및 포트'가 맞는지 확인하세요 (페어링 포트와 달라요).")
         try:
             out = self.adb_out("connect", addr, timeout=20)
