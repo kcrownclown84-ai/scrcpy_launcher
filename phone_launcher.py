@@ -333,6 +333,12 @@ class Phone:
     def key(self, serial: str, keycode: int | str) -> None:
         self.shell(serial, "input", "keyevent", str(keycode))
 
+    def display_power(self, serial: str, on: bool) -> bool:
+        """Android 15+ : 폰 화면 패널만 켜고 끄기 (폰은 깨어 있음). 지원 안 하면 False."""
+        out = self.shell(serial, "cmd", "display", "power-on" if on else "power-off", "0", timeout=8)
+        bad = ("Unknown command", "Error", "error", "not supported", "Exception")
+        return not any(b in out for b in bad)
+
     def is_awake(self, serial: str) -> bool:
         out = self.shell(serial, "dumpsys", "power", timeout=8)
         m = re.search(r"mWakefulness=(\w+)", out)
@@ -1093,7 +1099,7 @@ class MainWindow(QMainWindow):
         self.bus.error.connect(lambda m: QMessageBox.warning(self, APP_NAME, m))
         self.search.textChanged.connect(self._render_apps)
         self.chk_system.toggled.connect(lambda v: (self._set("show_system_apps", v), self._render_apps()))
-        self.dev_combo.currentIndexChanged.connect(lambda _: (self.refresh_apps(), self._update_mirror_btn(), self.refresh_battery()))
+        self.dev_combo.currentIndexChanged.connect(lambda _: self._on_combo_changed())
         for lst in (self.app_list, self.fav_list):
             lst.itemClicked.connect(self._on_app_clicked)
             lst.customContextMenuRequested.connect(lambda pos, l=lst: self._app_menu(l, pos))
@@ -1221,11 +1227,42 @@ class MainWindow(QMainWindow):
         if unauthorized:
             self.statusBar().showMessage("폰에서 'USB 디버깅 허용' 팝업을 눌러주세요.")
         self._update_mirror_btn()
-        self.refresh_apps()
-        self.refresh_battery()
+        # 기기 목록이 바뀔 때마다(무선 연결이 깜빡일 때 등) 앱 목록·아이콘을 다시 읽으면
+        # 폰에 계속 일을 시켜 발열이 생김 → 선택된 폰이 실제로 바뀐 경우에만 다시 읽음
+        serial = self.current_serial()
+        if serial and serial != getattr(self, "_loaded_serial", None):
+            self._loaded_serial = serial
+            self._cleanup_phone(serial)
+            self.refresh_apps()
+            self.refresh_battery()
+        elif not serial:
+            self._loaded_serial = None
 
     # ---------------- 앱 목록 ----------------
+    def _cleanup_phone(self, serial: str):
+        """이전 실행(런처가 강제 종료된 경우 등)에서 폰에 남은 scrcpy·아이콘 도우미 프로세스 정리."""
+        if any(x.serial == serial and x.proc.poll() is None for x in self.sessions):
+            return
+
+        def work():
+            for pat in ("com.genymobile.scrcpy.Server", "IconDump"):
+                try:
+                    self.phone.shell(serial, "pkill", "-f", pat, timeout=8)
+                except Exception:
+                    pass
+        bg(work)
+
+    def _on_combo_changed(self):
+        self._update_mirror_btn()
+        serial = self.current_serial()
+        if serial and serial != getattr(self, "_loaded_serial", None):
+            self._loaded_serial = serial
+            self.refresh_apps()
+            self.refresh_battery()
+
     def refresh_apps(self):
+        if getattr(self, "_apps_busy", False):  # 이미 읽는 중이면 또 시키지 않음
+            return
         serial = self.current_serial()
         if not serial:
             self.apps = []
@@ -1233,9 +1270,14 @@ class MainWindow(QMainWindow):
             return
         self.statusBar().showMessage("앱 목록 불러오는 중…")
 
+        self._apps_busy = True
+
         def work():
-            apps = self._safe(self.phone.list_apps, serial, default=[])
-            self.bus.apps.emit(serial, apps)
+            try:
+                apps = self._safe(self.phone.list_apps, serial, default=[])
+                self.bus.apps.emit(serial, apps)
+            finally:
+                self._apps_busy = False
         bg(work)
 
     def _on_apps(self, serial: str, apps: list[AppInfo]):
@@ -1251,6 +1293,10 @@ class MainWindow(QMainWindow):
         """캐시 → 없으면 폰에서 가져오기. 백그라운드에서 돌고, 받는 대로 화면에 반영."""
         if getattr(self, "_icon_job", None) == serial:
             return
+        tried = getattr(self, "_icon_tried", set())
+        if serial in tried:  # 한 번 시도한 폰은 다시 시도하지 않음 (실패해도 반복 X → 발열 방지)
+            return
+        self._icon_tried = tried | {serial}
         self._icon_job = serial
 
         def work():
@@ -1499,7 +1545,20 @@ class MainWindow(QMainWindow):
             self.bus.error.emit(f"scrcpy 실행 실패: {e}")
             raise
         s = Session(proc, serial, title, kind)
+        s.cmdline = " ".join(a if " " not in a else f'"{a}"' for a in args[1:])
         self.sessions.append(s)
+        self.statusBar().showMessage("scrcpy " + s.cmdline, 10000)
+        if kind == "main" and "--turn-screen-off" in args:
+            s.panel_off = True
+            # 시작 3초 뒤 한 번 더 화면 끄기 (삼성 등에서 시작 직후 다시 켜지는 경우 대비)
+            def again():
+                time.sleep(3)
+                if s.proc.poll() is None:
+                    try:
+                        self.phone.display_power(serial, False)
+                    except Exception:
+                        pass
+            bg(again)
         bg(self._watch, s)
         self._render_sessions()
         return s
@@ -1526,6 +1585,7 @@ class MainWindow(QMainWindow):
             kind = "폰 화면" if s.kind == "main" else "앱 창"
             it = QListWidgetItem(f"{'🖥' if s.kind == 'main' else '🪟'}  {s.title}   ·  {kind}  ·  {s.serial}")
             it.setData(Qt.UserRole, id(s))
+            it.setToolTip("실행 명령: scrcpy " + getattr(s, "cmdline", ""))
             self.run_list.addItem(it)
         self.tabs.setTabText(1, f"실행 중 ({len(self.sessions)})" if self.sessions else "실행 중")
 
@@ -1573,9 +1633,14 @@ class MainWindow(QMainWindow):
             self.batt.setText("")
             return
 
+        main = self._main_session(serial)
+
         def work():
             try:
                 self.bus.battery.emit(serial, self.phone.battery(serial))
+                # 폰 화면 끄기 상태여야 하는데 켜져 있으면 다시 끔 (30초마다, 가벼운 명령 하나)
+                if main and getattr(main, "panel_off", False):
+                    self.phone.display_power(serial, False)
             except Exception:
                 pass
         bg(work)
@@ -1614,6 +1679,14 @@ class MainWindow(QMainWindow):
             return
         off_now = getattr(s, "panel_off", bool(self.cfg["turn_screen_off"]))
         want_off = not off_now
+        try:
+            if self.phone.display_power(serial, not want_off):  # Android 15+: 창을 다시 열 필요 없음
+                s.panel_off = want_off
+                self.statusBar().showMessage("폰 화면을 껐어요. PC에서는 계속 보여요." if want_off
+                                             else "폰 화면을 켰어요.", 4000)
+                return
+        except Exception:
+            pass
         s.proc.terminate()
 
         def work():
