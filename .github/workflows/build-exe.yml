@@ -64,6 +64,11 @@ jobs:
             grep -q '^no.such.app - ' icons.txt
             grep '^com.android.settings iVBOR' icons.txt | cut -d' ' -f2 | base64 -d > settings.png && ls -la settings.png
             echo "ICON HELPER OK"
+            adb shell locksettings set-pin 1234 || true
+            adb shell input keyevent 26; sleep 2; adb shell input keyevent 224; sleep 2
+            echo "== LOCKED =="; adb shell dumpsys window policy | grep -iE "showing|lockscreen|keyguard" | head -20 || true
+            adb shell input keyevent 82; sleep 1; adb shell input text 1234; adb shell input keyevent 66; sleep 3
+            echo "== AFTER UNLOCK =="; adb shell dumpsys window policy | grep -iE "showing|lockscreen|keyguard" | head -20 || true
 
   build:
     needs: icon-helper

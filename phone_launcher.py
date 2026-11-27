@@ -76,6 +76,7 @@ DEFAULT_CONFIG = {
     "wifi_auto": True,          # 시작할 때 무선 자동 재연결
     "embed_mirror_exp": False,  # (실험) 폰 화면을 런처 안에 넣기 - 일부 PC에서 클릭이 안 먹어서 기본 꺼짐
     "auto_mirror": True,        # 폰이 연결되면 폰 화면 자동으로 열기
+    "pin_saved": "",            # (선택) DPAPI로 암호화한 잠금 PIN (base64)
     "power_save": False,        # 절전 모드: 해상도·FPS·화질을 낮춰 폰 발열/배터리 절약
 }
 
@@ -117,6 +118,25 @@ def delete_saved_config() -> None:
         LEGACY_CONFIG.unlink()
     except Exception:
         pass
+
+
+def dpapi(data: bytes, protect: bool) -> bytes:
+    """Windows DPAPI로 현재 Windows 사용자만 풀 수 있게 암호화/복호화."""
+    import ctypes
+    from ctypes import wintypes
+
+    class BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+    buf = ctypes.create_string_buffer(data, len(data))
+    src, out = BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char))), BLOB()
+    crypt32 = ctypes.windll.crypt32
+    fn = crypt32.CryptProtectData if protect else crypt32.CryptUnprotectData
+    if not fn(ctypes.byref(src), None, None, None, None, 0, ctypes.byref(out)):
+        raise OSError("DPAPI 실패")
+    try:
+        return ctypes.string_at(out.pbData, out.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(out.pbData)
 
 
 def find_scrcpy(custom: str = "") -> str | None:
@@ -349,6 +369,28 @@ class Phone:
         r = self.shell(serial, "am", "start", "--display", str(display_id),
                        "-f", "0x10000000", "-n", comp)
         return "Error" not in r
+
+    LOCK_RE = re.compile(r"(mShowingLockscreen|mDreamingLockscreen|isStatusBarKeyguard|"
+                         r"mIsShowing|keyguardShowing|KeyguardShowing)\s*[=:]\s*true", re.I)
+
+    def is_locked(self, serial: str) -> bool:
+        out = self.shell(serial, "dumpsys", "window", "policy", timeout=8)
+        if not out.strip():
+            out = self.shell(serial, "dumpsys", "window", timeout=8)
+        return bool(self.LOCK_RE.search(out))
+
+    def is_awake(self, serial: str) -> bool:
+        out = self.shell(serial, "dumpsys", "power", timeout=8)
+        m = re.search(r"mWakefulness=(\w+)", out)
+        return not m or m.group(1) == "Awake"
+
+    def unlock(self, serial: str, pin: str) -> None:
+        """잠금 해제: (필요하면 깨우고) 잠금 화면 올리고 PIN 입력 + 확인."""
+        self.key(serial, 82)          # 잠금 화면 → PIN 입력 화면
+        time.sleep(0.6)
+        self.shell(serial, "input", "text", pin)
+        time.sleep(0.2)
+        self.key(serial, 66)          # Enter
 
     def force_stop(self, serial: str, package: str) -> None:
         self.shell(serial, "am", "force-stop", package)
@@ -869,6 +911,17 @@ class MainWindow(QMainWindow):
         self.batt.setToolTip("폰 배터리·충전·온도 (30초마다 갱신)")
         v.addWidget(self.batt)
 
+        self.lock_bar = QFrame()
+        self.lock_bar.setStyleSheet("QFrame{background:#4A3A12;border-radius:8px;} QLabel{background:transparent;color:#FFD98A;}")
+        lb = QHBoxLayout(self.lock_bar)
+        lb.setContentsMargins(10, 6, 6, 6)
+        lb.addWidget(QLabel("🔒 폰이 잠겨 있어요. 잠금 해제 화면은 보안 때문에 PC에서 검게 보여요."), 1)
+        btn_pin = QPushButton("PIN으로 잠금 해제")
+        btn_pin.clicked.connect(self.ask_unlock)
+        lb.addWidget(btn_pin)
+        self.lock_bar.hide()
+        v.addWidget(self.lock_bar)
+
         self.tabs = QTabWidget()
         v.addWidget(self.tabs, 1)
 
@@ -1078,6 +1131,11 @@ class MainWindow(QMainWindow):
         tips.setWordWrap(True)
         tips.setObjectName("muted")
         f.addRow(tips)
+
+        btn_forget = QPushButton("기억한 잠금 PIN 지우기")
+        btn_forget.setObjectName("flat")
+        btn_forget.clicked.connect(lambda: (self._set("pin_saved", ""), self.statusBar().showMessage("기억한 PIN을 지웠어요.", 4000)))
+        f.addRow(btn_forget)
 
         btn_diag = QPushButton("앱 아이콘 다시 받기 + 진단")
         btn_diag.setObjectName("flat")
@@ -1722,7 +1780,88 @@ class MainWindow(QMainWindow):
         temp = f"<span style='color:{color}'>🌡 {t:.1f}°C{warn}</span>" if color else f"🌡 {t:.1f}°C"
         self.batt.setText(f"🔋 {b['level']}%  ·  {charge}  ·  {temp}")
 
+    def _check_lock(self):
+        serial = self.current_serial()
+        if not serial or not self._main_session(serial) or getattr(self, "_lock_busy", False):
+            if not (serial and self._main_session(serial)):
+                self.lock_bar.hide()
+            return
+        self._lock_busy = True
+
+        def work():
+            try:
+                locked = self.phone.is_locked(serial)
+                self.bus.call.emit(lambda: self.lock_bar.setVisible(locked))
+            except Exception:
+                pass
+            finally:
+                self._lock_busy = False
+        bg(work)
+
+    def ask_unlock(self):
+        serial = self.current_serial()
+        if not serial:
+            return
+        pin = ""
+        if self.cfg.get("pin_saved") and IS_WIN:
+            try:
+                import base64
+                pin = dpapi(base64.b64decode(self.cfg["pin_saved"]), False).decode()
+            except Exception:
+                pin = ""
+        remember = None
+        if not pin:
+            d = QDialog(self)
+            d.setWindowTitle("PIN으로 잠금 해제")
+            v = QVBoxLayout(d)
+            v.addWidget(QLabel("폰 잠금 PIN(또는 비밀번호)을 입력하세요.\n폰으로 바로 입력만 하고, 기억하기를 켜지 않으면 어디에도 저장하지 않아요."))
+            e = QLineEdit()
+            e.setEchoMode(QLineEdit.Password)
+            v.addWidget(e)
+            remember = QCheckBox("이 PC에 기억하기 (Windows 계정으로 암호화)")
+            remember.setEnabled(IS_WIN and not NO_SAVE)
+            v.addWidget(remember)
+            ok = QPushButton("잠금 해제")
+            ok.clicked.connect(d.accept)
+            e.returnPressed.connect(d.accept)
+            v.addWidget(ok)
+            if d.exec() != QDialog.Accepted or not e.text():
+                return
+            pin = e.text()
+            if remember.isChecked():
+                try:
+                    import base64
+                    self._set("pin_saved", base64.b64encode(dpapi(pin.encode(), True)).decode())
+                except Exception:
+                    pass
+        if not re.fullmatch(r"[0-9A-Za-z]+", pin):
+            QMessageBox.warning(self, APP_NAME, "영문/숫자 PIN만 자동 입력할 수 있어요. 폰 화면 창을 클릭하고 키보드로 직접 입력해 주세요.")
+            return
+
+        def work():
+            try:
+                was_awake = self.phone.is_awake(serial)
+                if not was_awake:
+                    self.phone.key(serial, 224)  # WAKEUP
+                    time.sleep(0.8)
+                self.phone.unlock(serial, pin)
+                time.sleep(1.5)
+                if self.phone.is_locked(serial):
+                    self.bus.status.emit("잠금 해제가 안 됐어요. PIN을 확인해 주세요.")
+                    if self.cfg.get("pin_saved"):
+                        self.bus.call.emit(lambda: self._set("pin_saved", ""))
+                    return
+                self.bus.status.emit("🔓 잠금 해제됐어요.")
+                self.bus.call.emit(lambda: self.lock_bar.hide())
+                if not was_awake and self.cfg.get("turn_screen_off"):
+                    # 깨우느라 켜진 폰 화면을 다시 끄기 위해 폰 화면 창을 다시 연다
+                    self.bus.call.emit(self._reopen_main)
+            except Exception as ex:
+                self.bus.status.emit(f"잠금 해제 실패: {ex}")
+        bg(work)
+
     def _tick(self):
+        self._check_lock()
         self._maybe_reconnect()
         self.refresh_devices()
         self._render_sessions()
