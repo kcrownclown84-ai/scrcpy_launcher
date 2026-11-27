@@ -62,6 +62,9 @@ DEFAULT_CONFIG = {
     "dock_window": True,        # scrcpy 창을 런처 옆에 붙이기
     "separate_windows": False,  # 앱마다 새 창(가상 디스플레이)
     "virtual_size": "1080x1920/420",
+    "aspect": "phone",          # 폰 화면 창 비율: phone(그대로 미러링) | 16:9 | 16:10 | 4:3 | 21:9 | custom
+    "aspect_landscape": True,   # 가로 방향
+    "aspect_custom": "1920x1080",
     "show_system_apps": False,
     "theme": "dark",            # dark | light | system
     "favorites": [],
@@ -173,6 +176,7 @@ class Session:
     title: str
     kind: str  # "main" | "app"
     started: float = field(default_factory=time.time)
+    display_id: int | None = None  # 가상 디스플레이 번호 (비율 모드)
 
 
 class Phone:
@@ -317,6 +321,16 @@ class Phone:
         self.shell(serial, "monkey", "-p", package, "-c",
                    "android.intent.category.LAUNCHER", "1")
 
+    def launch_on_display(self, serial: str, package: str, display_id: int) -> bool:
+        out = self.shell(serial, "cmd", "package", "resolve-activity", "--brief",
+                         "-c", "android.intent.category.LAUNCHER", package)
+        comp = next((l.strip() for l in reversed(out.splitlines()) if "/" in l), "")
+        if not comp:
+            return False
+        r = self.shell(serial, "am", "start", "--display", str(display_id),
+                       "-f", "0x10000000", "-n", comp)
+        return "Error" not in r
+
     def force_stop(self, serial: str, package: str) -> None:
         self.shell(serial, "am", "force-stop", package)
 
@@ -368,6 +382,28 @@ class Phone:
                 self.shell(serial, "rm", "-f", self.REMOTE_HELPER)
             except Exception:
                 pass
+
+    def icon_diag(self, serial: str, pkgs: list[str]) -> str:
+        """아이콘이 안 나올 때 원인 파악용 보고서."""
+        lines = [f"helper: {ICON_HELPER} exists={ICON_HELPER.is_file()}"]
+        try:
+            lines.append("device: " + " / ".join(
+                self.shell(serial, "getprop", k).strip() for k in
+                ("ro.product.manufacturer", "ro.product.model", "ro.build.version.release", "ro.build.version.sdk")))
+            r = run([self.adb, "-s", serial, "push", str(ICON_HELPER), self.REMOTE_HELPER], timeout=30)
+            lines.append(f"push rc={r.returncode}: " + (r.stdout + r.stderr).decode("utf-8", "replace").strip()[-300:])
+            r = run([self.adb, "-s", serial, "shell", "ICONDUMP_DEBUG=1", f"CLASSPATH={self.REMOTE_HELPER}",
+                     "app_process", "/", "IconDump", "48", *pkgs], timeout=90)
+            lines.append(f"run rc={r.returncode}")
+            for l in (r.stdout + r.stderr).decode("utf-8", "replace").splitlines():
+                bits = l.split(" ", 1)
+                if len(bits) == 2 and len(bits[1]) > 200 and bits[1].startswith("iVBOR"):
+                    l = f"{bits[0]} OK (png {len(bits[1])} chars)"
+                lines.append(l[:400])
+            self.shell(serial, "rm", "-f", self.REMOTE_HELPER)
+        except Exception as e:
+            lines.append(f"error: {e!r}")
+        return "\n".join(lines[:150])
 
     def list_apps(self, serial: str) -> list[AppInfo]:
         apps: list[AppInfo] = []
@@ -438,7 +474,7 @@ class Phone:
     def start(self, args: list[str]) -> subprocess.Popen:
         return subprocess.Popen(
             args, creationflags=NO_WINDOW, stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         )
 
 
@@ -480,6 +516,7 @@ class Bus(QObject):
     apps = Signal(str, list)
     icons = Signal(dict)
     battery = Signal(str, dict)
+    call = Signal(object)  # 백그라운드 스레드에서 UI 스레드로 함수 실행 요청
     status = Signal(str)
     error = Signal(str)
 
@@ -549,6 +586,35 @@ def build_style(theme: str) -> str:
     from string import Template
     return Template(STYLE_TMPL).substitute(THEMES[theme])
 
+
+
+ASPECTS = [  # (key, 표시 이름, 가로 기준 해상도)
+    ("phone", "폰 화면 그대로 (미러링)", None),
+    ("16:9", "16:9 와이드 (모니터·게임)", (1920, 1080)),
+    ("16:10", "16:10 (노트북)", (1920, 1200)),
+    ("4:3", "4:3 (태블릿)", (1600, 1200)),
+    ("21:9", "21:9 울트라와이드", (2520, 1080)),
+    ("custom", "직접 입력", None),
+]
+
+
+def aspect_display(cfg: dict) -> str | None:
+    """설정된 비율 → scrcpy --new-display 값 (WxH/dpi). phone이면 None."""
+    key = cfg.get("aspect", "phone")
+    if key == "phone":
+        return None
+    if key == "custom":
+        m = re.match(r"^\s*(\d+)\s*[x×*]\s*(\d+)", cfg.get("aspect_custom", ""))
+        if not m:
+            return None
+        w, h = int(m.group(1)), int(m.group(2))
+        w, h = max(w, h), min(w, h)
+    else:
+        w, h = next(r for k, _, r in ASPECTS if k == key)
+    if not cfg.get("aspect_landscape", True):
+        w, h = h, w
+    dpi = max(160, min(480, int(min(w, h) / 1080 * 280)))  # 글자가 너무 작지 않게
+    return f"{w}x{h}/{dpi}"
 
 
 class WifiDialog(QDialog):
@@ -849,7 +915,7 @@ class MainWindow(QMainWindow):
             ("🔉", "볼륨 -", lambda s: self.phone.key(s, 25)),
             ("🔇", "음소거", lambda s: self.phone.key(s, 164)),
             None,
-            ("⟳", "화면 회전 (세로/가로)", lambda s: self.phone.rotate(s)),
+            ("⟳", "가로/세로 전환", lambda s: self.rotate_view(s)),
             ("📷", "스크린샷 (사진 폴더에 저장)", self._screenshot),
             ("🔔", "알림창 내리기", lambda s: self.phone.shell(s, "cmd", "statusbar", "expand-notifications")),
             None,
@@ -918,6 +984,39 @@ class MainWindow(QMainWindow):
         f.addRow("최대 FPS", spin("max_fps", 15, 144, 15, " fps"))
         f.addRow("화질(비트레이트)", spin("bitrate_mbps", 1, 64, 1, " Mbps"))
 
+        arow = QHBoxLayout()
+        self.s_aspect = QComboBox()
+        for key, label, _ in ASPECTS:
+            self.s_aspect.addItem(label, key)
+        self.s_aspect.setCurrentIndex(max(0, self.s_aspect.findData(c.get("aspect", "phone"))))
+        self.s_custom = QLineEdit(c.get("aspect_custom", "1920x1080"), placeholderText="예) 2560x1080")
+        self.s_custom.setMaximumWidth(120)
+        self.s_land = QCheckBox("가로")
+        self.s_land.setChecked(bool(c.get("aspect_landscape", True)))
+        arow.addWidget(self.s_aspect, 1)
+        arow.addWidget(self.s_custom)
+        arow.addWidget(self.s_land)
+        f.addRow("화면 비율", arow)
+
+        def aspect_changed():
+            self.cfg["aspect"] = self.s_aspect.currentData()
+            self.cfg["aspect_custom"] = self.s_custom.text().strip()
+            self.cfg["aspect_landscape"] = self.s_land.isChecked()
+            save_config(self.cfg)
+            self.s_custom.setVisible(self.cfg["aspect"] == "custom")
+            self.s_land.setEnabled(self.cfg["aspect"] != "phone")
+            self._reopen_main()
+        self.s_aspect.currentIndexChanged.connect(lambda _: aspect_changed())
+        self.s_custom.editingFinished.connect(aspect_changed)
+        self.s_land.toggled.connect(lambda _: aspect_changed())
+        self.s_custom.setVisible(c.get("aspect") == "custom")
+        self.s_land.setEnabled(c.get("aspect", "phone") != "phone")
+        note = QLabel("'폰 화면 그대로'가 아니면 원하는 비율의 가상 화면을 새로 만들어 앱을 그 모양에 맞게 띄워요 "
+                      "(Android 10+). 일부 앱(은행·DRM 영상 등)은 가상 화면에서 안 열리거나 검게 나올 수 있어요.")
+        note.setWordWrap(True)
+        note.setObjectName("muted")
+        f.addRow(note)
+
         self.s_vsize = QLineEdit(c["virtual_size"])
         self.s_vsize.editingFinished.connect(lambda: self._set("virtual_size", self.s_vsize.text().strip()))
         f.addRow("새 창 크기/DPI", self.s_vsize)
@@ -929,6 +1028,11 @@ class MainWindow(QMainWindow):
         tips.setWordWrap(True)
         tips.setObjectName("muted")
         f.addRow(tips)
+
+        btn_diag = QPushButton("앱 아이콘 다시 받기 + 진단")
+        btn_diag.setObjectName("flat")
+        btn_diag.clicked.connect(self.icon_diagnose)
+        f.addRow(btn_diag)
 
         self.s_nosave = QCheckBox("설정 저장 안 함 (PC에 설정 파일을 남기지 않음)")
         self.s_nosave.setChecked(NO_SAVE)
@@ -947,6 +1051,7 @@ class MainWindow(QMainWindow):
         self.bus.apps.connect(self._on_apps)
         self.bus.icons.connect(self._on_icons)
         self.bus.battery.connect(self._on_battery)
+        self.bus.call.connect(lambda fn: fn())
         self.bus.status.connect(lambda m: self.statusBar().showMessage(m, 6000))
         self.bus.error.connect(lambda m: QMessageBox.warning(self, APP_NAME, m))
         self.search.textChanged.connect(self._render_apps)
@@ -1113,6 +1218,38 @@ class MainWindow(QMainWindow):
                 self._icon_job = None
         bg(work)
 
+    def icon_diagnose(self):
+        serial = self.current_serial()
+        if not serial:
+            QMessageBox.information(self, APP_NAME, "연결된 폰이 없어요.")
+            return
+        # 캐시를 비우고 다시 받기
+        self.icons.clear()
+        shutil.rmtree(ICON_DIR, ignore_errors=True)
+        sample = [a.package for a in self.apps if not a.system][:3] or [a.package for a in self.apps][:3]
+        self.statusBar().showMessage("아이콘 진단 중…")
+
+        def work():
+            report = self.phone.icon_diag(serial, sample)
+            self.bus.call.emit(lambda: self._show_report(report))
+            self.load_icons(serial, self.apps)
+        bg(work)
+
+    def _show_report(self, text: str):
+        from PySide6.QtWidgets import QPlainTextEdit
+        d = QDialog(self)
+        d.setWindowTitle("아이콘 진단 결과")
+        d.resize(640, 420)
+        v = QVBoxLayout(d)
+        v.addWidget(QLabel("아이콘이 계속 안 나오면 이 내용을 복사해서 보내주세요."))
+        box = QPlainTextEdit(text)
+        box.setReadOnly(True)
+        v.addWidget(box, 1)
+        b = QPushButton("복사하고 닫기")
+        b.clicked.connect(lambda: (QApplication.clipboard().setText(text), d.accept()))
+        v.addWidget(b)
+        d.exec()
+
     def _on_icons(self, got: dict):
         for pkg, data in got.items():
             pm = QPixmap()
@@ -1209,9 +1346,38 @@ class MainWindow(QMainWindow):
             self.open_main(serial)
         QTimer.singleShot(400, self._update_mirror_btn)
 
+    def _reopen_main(self):
+        """비율이 바뀌면 열려 있는 폰 화면 창을 새 설정으로 다시 연다."""
+        serial = self.current_serial()
+        s = serial and self._main_session(serial)
+        if not s:
+            return
+        s.proc.terminate()
+
+        def again():
+            try:
+                s.proc.wait(timeout=3)
+            except Exception:
+                pass
+            self.bus.call.emit(lambda: (self.open_main(serial), self._update_mirror_btn()))
+        bg(again)
+
+    def rotate_view(self, serial: str):
+        if self.cfg.get("aspect", "phone") == "phone":
+            self.phone.rotate(serial)
+        else:  # 비율 모드: 가로/세로를 바꿔서 창을 다시 연다
+            self.cfg["aspect_landscape"] = not self.cfg.get("aspect_landscape", True)
+            save_config(self.cfg)
+            self.bus.call.emit(lambda: (self.s_land.blockSignals(True),
+                                          self.s_land.setChecked(self.cfg["aspect_landscape"]),
+                                          self.s_land.blockSignals(False), self._reopen_main()))
+
     def open_main(self, serial: str, start_app: str | None = None) -> Session:
         args = self.phone.base_args(serial, self.cfg)
-        if self.cfg["turn_screen_off"]:
+        vd = aspect_display(self.cfg)
+        if vd:  # 원하는 비율의 가상 화면을 만들어서 그 안에서 앱 실행 (폰 본체 화면과 별개)
+            args.append(f"--new-display={vd}")
+        elif self.cfg["turn_screen_off"]:
             args.append("--turn-screen-off")
         args += self._dock_args()
         title = f"{APP_NAME} - {self._device_name(serial)}"
@@ -1241,6 +1407,9 @@ class MainWindow(QMainWindow):
             def work():
                 if restart:
                     self.phone.force_stop(serial, pkg)
+                if main.display_id is not None:
+                    if self.phone.launch_on_display(serial, pkg, main.display_id):
+                        return
                 self.phone.launch_via_adb(serial, pkg)
             bg(self._safe, work)
             self.bus.status.emit(f"'{name}' 실행")
@@ -1263,9 +1432,16 @@ class MainWindow(QMainWindow):
 
     def _watch(self, s: Session):
         """scrcpy가 바로 죽으면 에러 메시지를 보여준다."""
-        _, err = s.proc.communicate()
+        lines = []
+        for raw in iter(s.proc.stdout.readline, b""):
+            line = raw.decode("utf-8", "replace").rstrip()
+            lines = (lines + [line])[-60:]
+            m = re.search(r"New display:.*\(id=(\d+)\)", line)
+            if m:
+                s.display_id = int(m.group(1))
+        s.proc.wait()
         if s.proc.returncode not in (0, None) and time.time() - s.started < 8:
-            msg = err.decode("utf-8", "replace").strip().splitlines()
+            msg = lines
             tail = "\n".join(l for l in msg if "ERROR" in l or "WARN" in l)[-800:] or "\n".join(msg[-6:])
             self.bus.error.emit(f"'{s.title}' 창을 열지 못했어요.\n\n{tail}")
 

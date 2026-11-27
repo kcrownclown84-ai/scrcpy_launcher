@@ -33,6 +33,14 @@ jobs:
     needs: icon-helper
     runs-on: ubuntu-latest
     continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - api: 30
+            target: default
+          - api: 34
+            target: google_apis
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -44,12 +52,14 @@ jobs:
       - name: Run icon helper on an emulator
         uses: reactivecircus/android-emulator-runner@v2
         with:
-          api-level: 30
+          api-level: ${{ matrix.api }}
+          target: ${{ matrix.target }}
           arch: x86_64
           disable-animations: true
           script: |
             adb push iconhelper.jar /data/local/tmp/pl_icons.jar
-            adb shell ICONDUMP_DEBUG=1 CLASSPATH=/data/local/tmp/pl_icons.jar app_process / IconDump 96 com.android.settings com.android.contacts no.such.app > icons.txt 2>&1; cat icons.txt | cut -c1-200
+            adb shell ICONDUMP_DEBUG=1 CLASSPATH=/data/local/tmp/pl_icons.jar app_process / IconDump 96 com.android.settings com.android.contacts com.android.vending com.google.android.apps.maps no.such.app > icons.txt 2>&1; cat icons.txt | cut -c1-200
+            adb shell cmd package resolve-activity --brief -c android.intent.category.LAUNCHER com.android.settings
             test "$(grep -c '^com.android.settings iVBOR' icons.txt)" = "1"
             grep -q '^no.such.app - ' icons.txt
             grep '^com.android.settings iVBOR' icons.txt | cut -d' ' -f2 | base64 -d > settings.png && ls -la settings.png
